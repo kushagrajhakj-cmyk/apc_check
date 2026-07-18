@@ -32,13 +32,13 @@ class ANNModel(nn.Module):
 
         self.network = nn.Sequential(
 
-            nn.Linear(6,32),
+            nn.Linear(9,32),
             nn.ReLU(),
 
             nn.Linear(32,16),
             nn.ReLU(),
 
-            nn.Linear(16,2)
+            nn.Linear(16,3)
 
         )
 
@@ -103,19 +103,28 @@ df = load_data()
 
 feature_names = [
 
-    "Reactor_Pressure",
-    "Feed_Temperature",
-    "Feed_Rate",
-    "Reactor_Temperature",
-    "Hydrogen_Flow",
-    "Catalyst_Loading"
+    "Rxn Temp. oC",
+    "C2 Pressure kg/cm2",
+    "H2/C2",
+    "C4/C2",
+    "C6/C2",
+    "ICA mol %",
+    "Al/Ti",
+    "Feed rate (kg/h)",
+    "Catalyst rate (kg/h)"
 
 ]
 
 # Product-quality columns aren't guaranteed to exist under these exact
 # names in every data file, so detect them rather than hardcoding —
 # this is also what caused the earlier KeyError.
-target_names = [c for c in ["MFI", "Yield"] if c in df.columns]
+target_names = [
+    c for c in [
+        "MFI @2.16 kg/cm2",
+        "Productivity kg PE/g cat",
+        "Density g/cc"
+    ] if c in df.columns
+]
 
 
 def compute_rolling_features(df, feature_names, window):
@@ -227,29 +236,35 @@ def ensemble_predict(input_vector):
 
 def optimize_process(
 
-    pressure,
-    feed_temp,
     feed_rate,
+    c2_pressure,
     target_mfi,
-    target_yield
+    target_productivity,
+    target_density
 
 ):
 
     def objective(x):
 
-        reactor_temp = x[0]
-        hydrogen = x[1]
-        catalyst = x[2]
+        rxn_temp = x[0]
+        h2_c2 = x[1]
+        c4_c2 = x[2]
+        c6_c2 = x[3]
+        ica = x[4]
+        al_ti = x[5]
+        cat_rate = x[6]
 
         input_vector = [
 
-            pressure,
-            feed_temp,
+            rxn_temp,
+            c2_pressure,
+            h2_c2,
+            c4_c2,
+            c6_c2,
+            ica,
+            al_ti,
             feed_rate,
-
-            reactor_temp,
-            hydrogen,
-            catalyst
+            cat_rate
 
         ]
 
@@ -257,17 +272,23 @@ def optimize_process(
             input_vector
         )
 
+        # Relative errors so MFI (~10), productivity (~7) and
+        # density (~0.95) are weighted comparably.
         loss = (
 
-            (pred[0]-target_mfi)**2
+            ((pred[0]-target_mfi)/max(target_mfi,1e-6))**2
 
             +
 
-            (pred[1]-target_yield)**2
+            ((pred[1]-target_productivity)/max(target_productivity,1e-6))**2
 
             +
 
-            0.5*np.sum(std)
+            ((pred[2]-target_density)/max(target_density,1e-6))**2
+
+            +
+
+            0.01*np.sum(std/np.abs(pred).clip(1e-6))
 
         )
 
@@ -275,9 +296,13 @@ def optimize_process(
 
     bounds = [
 
-        (200,260),
-        (10,60),
-        (0.5,3.0)
+        (80,110),      # Rxn Temp. oC
+        (0.05,0.50),   # H2/C2
+        (0.0,0.40),    # C4/C2
+        (0.0,0.15),    # C6/C2
+        (0.0,12.0),    # ICA mol %
+        (20,120),      # Al/Ti
+        (5,15)         # Catalyst rate (kg/h)
 
     ]
 
@@ -355,14 +380,18 @@ with tab1:
     current = df.iloc[-1]
 
     defaults = {
-        "feed_temp": float(current["Feed_Temperature"]),
-        "feed_rate": float(current["Feed_Rate"]),
-        "reactor_temp": float(current["Reactor_Temperature"]),
-        "reactor_pressure": float(current["Reactor_Pressure"]),
-        "hydrogen_flow": float(current["Hydrogen_Flow"]),
-        "catalyst_loading": float(current["Catalyst_Loading"]),
-        "mfi_pred": float(current["MFI"]),
-        "yield_pred": float(current["Yield"])
+        "feed_rate": float(current["Feed rate (kg/h)"]),
+        "c2_pressure": float(current["C2 Pressure kg/cm2"]),
+        "rxn_temp": float(current["Rxn Temp. oC"]),
+        "h2_c2": float(current["H2/C2"]),
+        "c4_c2": float(current["C4/C2"]),
+        "c6_c2": float(current["C6/C2"]),
+        "ica_mol": float(current["ICA mol %"]),
+        "al_ti": float(current["Al/Ti"]),
+        "cat_rate": float(current["Catalyst rate (kg/h)"]),
+        "mfi_pred": float(current["MFI @2.16 kg/cm2"]),
+        "prod_pred": float(current["Productivity kg PE/g cat"]),
+        "dens_pred": float(current["Density g/cc"])
     }
 
     for k, v in defaults.items():
@@ -383,72 +412,138 @@ overflow:hidden;
 font-family:Arial;
 ">
 
-<!-- ================= FEED ================= -->
+<!-- ================= C2 FEED (flow + pressure) ================= -->
+<!-- horizontal line from x=40 to x=420 (reactor left edge) -->
 
 <div style="
 position:absolute;
 left:40px;
-top:270px;
-width:260px;
+top:300px;
+width:380px;
 border-top:4px solid #1E88E5;
 "></div>
 
 <div style="
 position:absolute;
-left:45px;
-top:205px;
-color:#0D47A1;
-font-size:14px;
-">
-<b>FEED</b><br>
-T = {st.session_state.feed_temp:.1f} °C<br>
-Flow = {st.session_state.feed_rate:.1f} m³/h
-</div>
-
-<!-- ================= COMONOMER ================= -->
+left:406px;
+top:294px;
+width:0;height:0;
+border-top:7px solid transparent;
+border-bottom:7px solid transparent;
+border-left:14px solid #1E88E5;
+"></div>
 
 <div style="
 position:absolute;
-left:180px;
-top:185px;
-width:120px;
+left:45px;
+top:240px;
+color:#0D47A1;
+font-size:14px;
+">
+<b>C2 FEED</b><br>
+Flow = {st.session_state.feed_rate:.0f} kg/h<br>
+P = {st.session_state.c2_pressure:.1f} kg/cm&sup2;
+</div>
+
+<!-- ================= COMONOMER (C4/C2, C6/C2 ratios) ================= -->
+<!-- horizontal line from x=140 to x=420 (reactor left edge) -->
+
+<div style="
+position:absolute;
+left:140px;
+top:380px;
+width:280px;
 border-top:3px solid green;
 "></div>
 
 <div style="
 position:absolute;
-left:70px;
-top:140px;
+left:406px;
+top:374px;
+width:0;height:0;
+border-top:7px solid transparent;
+border-bottom:7px solid transparent;
+border-left:14px solid green;
+"></div>
+
+<div style="
+position:absolute;
+left:145px;
+top:395px;
 color:green;
 font-size:13px;
 ">
 <b>COMONOMER</b><br>
-Flow = 15 kg/h<br>
-T = 55 °C
+C4/C2 = {st.session_state.c4_c2:.3f}<br>
+C6/C2 = {st.session_state.c6_c2:.3f}
 </div>
 
-<!-- ================= H2 ================= -->
+<!-- ================= H2 (ratio to C2) ================= -->
+<!-- vertical line ending at y=110 (reactor top edge) -->
 
 <div style="
 position:absolute;
-left:510px;
-top:25px;
+left:468px;
+top:55px;
 width:4px;
-height:90px;
+height:55px;
 background:#1976D2;
 "></div>
 
 <div style="
 position:absolute;
-left:435px;
-top:5px;
+left:462px;
+top:96px;
+width:0;height:0;
+border-left:7px solid transparent;
+border-right:7px solid transparent;
+border-top:14px solid #1976D2;
+"></div>
+
+<div style="
+position:absolute;
+left:400px;
+top:10px;
 color:#1565C0;
 text-align:center;
 font-size:14px;
 ">
-<b>H₂</b><br>
-Flow = {st.session_state.hydrogen_flow:.1f} kg/h<br>
-T = 45 °C
+<b>H&#8322;</b><br>
+H2/C2 = {st.session_state.h2_c2:.3f}
+</div>
+
+<!-- ================= ICA (induced condensing agent) ================= -->
+<!-- vertical line ending at y=110 (reactor top edge) -->
+
+<div style="
+position:absolute;
+left:548px;
+top:55px;
+width:4px;
+height:55px;
+background:#8E24AA;
+"></div>
+
+<div style="
+position:absolute;
+left:542px;
+top:96px;
+width:0;height:0;
+border-left:7px solid transparent;
+border-right:7px solid transparent;
+border-top:14px solid #8E24AA;
+"></div>
+
+<div style="
+position:absolute;
+left:530px;
+top:10px;
+color:#6A1B9A;
+text-align:center;
+font-size:14px;
+">
+<b>ICA</b><br>
+{st.session_state.ica_mol:.1f} mol %
 </div>
 
 <!-- ================= REACTOR ================= -->
@@ -500,23 +595,20 @@ FLUIDIZED BED
 
 <br><br>
 
-Temperature<br>
-{st.session_state.reactor_temp:.1f} °C
+Rxn Temperature<br>
+{st.session_state.rxn_temp:.1f} &deg;C
 
 <br><br>
 
-Pressure<br>
-{st.session_state.reactor_pressure:.1f} bar
-
-<br><br>
-
-ICA = 8 wt%
+C2 Pressure<br>
+{st.session_state.c2_pressure:.1f} kg/cm&sup2;
 
 </div>
 
 </div>
 
 <!-- ================= CATALYST ================= -->
+<!-- vertical line from y=470 (reactor bottom edge) down -->
 
 <div style="
 position:absolute;
@@ -529,17 +621,28 @@ background:red;
 
 <div style="
 position:absolute;
-left:350px;
-top:540px;
+left:465px;
+top:460px;
+width:0;height:0;
+border-left:7px solid transparent;
+border-right:7px solid transparent;
+border-bottom:14px solid red;
+"></div>
+
+<div style="
+position:absolute;
+left:395px;
+top:545px;
 color:red;
 text-align:center;
 font-size:13px;
 ">
 <b>CATALYST</b><br>
-{st.session_state.catalyst_loading:.2f} kg/h
+{st.session_state.cat_rate:.2f} kg/h
 </div>
 
-<!-- ================= COCATALYST ================= -->
+<!-- ================= COCATALYST (Al/Ti) ================= -->
+<!-- vertical line from y=470 (reactor bottom edge) down -->
 
 <div style="
 position:absolute;
@@ -552,17 +655,28 @@ background:orange;
 
 <div style="
 position:absolute;
-left:560px;
-top:540px;
+left:545px;
+top:460px;
+width:0;height:0;
+border-left:7px solid transparent;
+border-right:7px solid transparent;
+border-bottom:14px solid orange;
+"></div>
+
+<div style="
+position:absolute;
+left:525px;
+top:545px;
 color:orange;
 text-align:center;
 font-size:13px;
 ">
 <b>COCATALYST</b><br>
-5.0 kg/h
+Al/Ti = {st.session_state.al_ti:.1f}
 </div>
 
 <!-- ================= PRODUCT ================= -->
+<!-- horizontal line from x=600 (reactor right edge) -->
 
 <div style="
 position:absolute;
@@ -574,18 +688,28 @@ border-top:4px solid #1E88E5;
 
 <div style="
 position:absolute;
-left:835px;
-top:225px;
+left:818px;
+top:284px;
+width:0;height:0;
+border-top:7px solid transparent;
+border-bottom:7px solid transparent;
+border-left:14px solid #1E88E5;
+"></div>
+
+<div style="
+position:absolute;
+left:640px;
+top:195px;
 color:#0D47A1;
 font-size:14px;
 ">
 <b>PRODUCT</b><br>
 
-Productivity = {st.session_state.yield_pred:.2f} t/h<br>
+MFI @2.16 = {st.session_state.mfi_pred:.2f}<br>
 
-MFI = {st.session_state.mfi_pred:.2f}<br>
+Productivity = {st.session_state.prod_pred:.2f} kg PE/g cat<br>
 
-Density = 0.918 g/cm³
+Density = {st.session_state.dens_pred:.4f} g/cc
 
 </div>
 
@@ -602,37 +726,55 @@ unsafe_allow_html=True
     with c1:
 
         st.number_input(
-         "Feed Temperature (°C)",
-          key="feed_temp"
+         "C2 Feed Rate (kg/h)",
+          key="feed_rate"
          )
 
         st.number_input(
-         "Feed Rate",
-         key="feed_rate"
+         "C2 Pressure (kg/cm²)",
+         key="c2_pressure"
+        )
+
+        st.number_input(
+            "Rxn Temperature (°C)",
+            key="rxn_temp"
         )
 
     with c2:
 
         st.number_input(
-            "Reactor Temperature (°C)",
-            key="reactor_temp"
+            "H2/C2 ratio",
+            key="h2_c2",
+            format="%.3f"
         )
 
         st.number_input(
-            "Reactor Pressure (bar)",
-            key="reactor_pressure"
+            "C4/C2 ratio",
+            key="c4_c2",
+            format="%.3f"
+        )
+
+        st.number_input(
+            "C6/C2 ratio",
+            key="c6_c2",
+            format="%.3f"
         )
 
     with c3:
 
         st.number_input(
-            "Hydrogen Flow",
-            key="hydrogen_flow"
+            "ICA (mol %)",
+            key="ica_mol"
         )
 
         st.number_input(
-            "Catalyst Loading",
-            key="catalyst_loading"
+            "Al/Ti ratio",
+            key="al_ti"
+        )
+
+        st.number_input(
+            "Catalyst Rate (kg/h)",
+            key="cat_rate"
         )
 
 
@@ -646,12 +788,15 @@ unsafe_allow_html=True
 
         input_vector = [
 
-            st.session_state.reactor_pressure,
-            st.session_state.feed_temp,
+            st.session_state.rxn_temp,
+            st.session_state.c2_pressure,
+            st.session_state.h2_c2,
+            st.session_state.c4_c2,
+            st.session_state.c6_c2,
+            st.session_state.ica_mol,
+            st.session_state.al_ti,
             st.session_state.feed_rate,
-            st.session_state.reactor_temp,
-            st.session_state.hydrogen_flow,
-            st.session_state.catalyst_loading
+            st.session_state.cat_rate
 
         ]
 
@@ -660,18 +805,16 @@ unsafe_allow_html=True
         )
 
         st.session_state.mfi_pred = float(pred[0])
-        st.session_state.yield_pred = float(pred[1])
+        st.session_state.prod_pred = float(pred[1])
+        st.session_state.dens_pred = float(pred[2])
 
         confidence = np.exp(
-            -np.mean(std)
+            -np.mean(std/np.abs(pred).clip(1e-6))
         ) * 100
 
         st.success(
             f"Prediction Completed | Confidence = {confidence:.1f}%"
         )
-
-        mfi = st.session_state.mfi_pred
-        yield_value = st.session_state.yield_pred
 
         
 
@@ -1004,33 +1147,23 @@ with tab3:
             "### Current Plant Conditions"
         )
 
-        pressure = st.number_input(
-
-            "Reactor Pressure",
-
-            value=22.0,
-
-            key="opt_pressure"
-
-        )
-
-        feed_temp = st.number_input(
-
-            "Feed Temperature",
-
-            value=75.0,
-
-            key="opt_feed_temp"
-
-        )
-
         feed_rate = st.number_input(
 
-            "Feed Rate",
+            "C2 Feed Rate (kg/h)",
 
-            value=120.0,
+            value=10000.0,
 
             key="opt_feed_rate"
+
+        )
+
+        c2_pressure = st.number_input(
+
+            "C2 Pressure (kg/cm²)",
+
+            value=20.0,
+
+            key="opt_c2_pressure"
 
         )
 
@@ -1042,21 +1175,33 @@ with tab3:
 
         target_mfi = st.number_input(
 
-            "Target MFI",
+            "Target MFI @2.16 kg/cm²",
 
-            value=35.0,
+            value=5.0,
 
             key="opt_target_mfi"
 
         )
 
-        target_yield = st.number_input(
+        target_productivity = st.number_input(
 
-            "Target yield",
+            "Target Productivity (kg PE/g cat)",
 
-            value=90.0,
+            value=7.0,
 
-            key="opt_target_yield"
+            key="opt_target_productivity"
+
+        )
+
+        target_density = st.number_input(
+
+            "Target Density (g/cc)",
+
+            value=0.935,
+
+            format="%.4f",
+
+            key="opt_target_density"
 
         )
 
@@ -1078,37 +1223,51 @@ with tab3:
 
             result = optimize_process(
 
-                pressure,
-
-                feed_temp,
-
                 feed_rate,
+
+                c2_pressure,
 
                 target_mfi,
 
-                target_yield
+                target_productivity,
+
+                target_density
 
             )
 
         best_temp = result.x[0]
 
-        best_h2 = result.x[1]
+        best_h2_c2 = result.x[1]
 
-        best_cat = result.x[2]
+        best_c4_c2 = result.x[2]
+
+        best_c6_c2 = result.x[3]
+
+        best_ica = result.x[4]
+
+        best_al_ti = result.x[5]
+
+        best_cat_rate = result.x[6]
 
         optimal_input = [
 
-            pressure,
+            best_temp,
 
-            feed_temp,
+            c2_pressure,
+
+            best_h2_c2,
+
+            best_c4_c2,
+
+            best_c6_c2,
+
+            best_ica,
+
+            best_al_ti,
 
             feed_rate,
 
-            best_temp,
-
-            best_h2,
-
-            best_cat
+            best_cat_rate
 
         ]
 
@@ -1128,7 +1287,7 @@ with tab3:
 
             st.metric(
 
-                "Reactor Temperature",
+                "Rxn Temperature (°C)",
 
                 f"{best_temp:.2f}"
 
@@ -1136,17 +1295,49 @@ with tab3:
 
             st.metric(
 
-                "Hydrogen Flow",
+                "H2/C2 ratio",
 
-                f"{best_h2:.2f}"
+                f"{best_h2_c2:.3f}"
 
             )
 
             st.metric(
 
-                "Catalyst Loading",
+                "C4/C2 ratio",
 
-                f"{best_cat:.2f}"
+                f"{best_c4_c2:.3f}"
+
+            )
+
+            st.metric(
+
+                "C6/C2 ratio",
+
+                f"{best_c6_c2:.3f}"
+
+            )
+
+            st.metric(
+
+                "ICA (mol %)",
+
+                f"{best_ica:.2f}"
+
+            )
+
+            st.metric(
+
+                "Al/Ti ratio",
+
+                f"{best_al_ti:.1f}"
+
+            )
+
+            st.metric(
+
+                "Catalyst Rate (kg/h)",
+
+                f"{best_cat_rate:.2f}"
 
             )
 
@@ -1158,7 +1349,7 @@ with tab3:
 
             st.metric(
 
-                "Predicted MFI",
+                "Predicted MFI @2.16 kg/cm²",
 
                 f"{pred[0]:.2f}"
 
@@ -1166,9 +1357,17 @@ with tab3:
 
             st.metric(
 
-                "Predicted yield",
+                "Predicted Productivity (kg PE/g cat)",
 
                 f"{pred[1]:.2f}"
+
+            )
+
+            st.metric(
+
+                "Predicted Density (g/cc)",
+
+                f"{pred[2]:.4f}"
 
             )
 
@@ -1178,11 +1377,19 @@ with tab3:
 
             "Variable":[
 
-                "Reactor Temperature",
+                "Rxn Temperature (°C)",
 
-                "Hydrogen Flow",
+                "H2/C2",
 
-                "Catalyst Loading"
+                "C4/C2",
+
+                "C6/C2",
+
+                "ICA (mol %)",
+
+                "Al/Ti",
+
+                "Catalyst Rate (kg/h)"
 
             ],
 
@@ -1190,9 +1397,17 @@ with tab3:
 
                 best_temp,
 
-                best_h2,
+                best_h2_c2,
 
-                best_cat
+                best_c4_c2,
+
+                best_c6_c2,
+
+                best_ica,
+
+                best_al_ti,
+
+                best_cat_rate
 
             ]
 
@@ -1211,7 +1426,7 @@ with tab3:
         )
 
         confidence = np.exp(
-            -np.mean(std)
+            -np.mean(std/np.abs(pred).clip(1e-6))
         ) * 100
 
         st.subheader(
@@ -1242,12 +1457,15 @@ with tab4:
 
     sample_input = [
 
-        sample["Reactor_Pressure"],
-        sample["Feed_Temperature"],
-        sample["Feed_Rate"],
-        sample["Reactor_Temperature"],
-        sample["Hydrogen_Flow"],
-        sample["Catalyst_Loading"]
+        sample["Rxn Temp. oC"],
+        sample["C2 Pressure kg/cm2"],
+        sample["H2/C2"],
+        sample["C4/C2"],
+        sample["C6/C2"],
+        sample["ICA mol %"],
+        sample["Al/Ti"],
+        sample["Feed rate (kg/h)"],
+        sample["Catalyst rate (kg/h)"]
 
     ]
 
@@ -1274,11 +1492,18 @@ with tab4:
 
         ],
 
-        "yield":[
+        "Productivity":[
 
             preds[0][1],
             preds[1][1],
           
+
+        ],
+
+        "Density":[
+
+            preds[0][2],
+            preds[1][2]
 
         ]
 
@@ -1312,14 +1537,31 @@ with tab4:
 
         x="Model",
 
-        y="yield",
+        y="Productivity",
 
-        title="yield Prediction Comparison"
+        title="Productivity Prediction Comparison"
 
     )
 
     st.plotly_chart(
         fig2,
+        use_container_width=True
+    )
+
+    fig3 = px.bar(
+
+        agreement,
+
+        x="Model",
+
+        y="Density",
+
+        title="Density Prediction Comparison"
+
+    )
+
+    st.plotly_chart(
+        fig3,
         use_container_width=True
     )
 
