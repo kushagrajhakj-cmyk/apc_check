@@ -237,22 +237,27 @@ def ensemble_predict(input_vector):
 def optimize_process(
 
     feed_rate,
-    c2_pressure,
     target_mfi,
     target_productivity,
     target_density
 
 ):
+    # C2 pressure is now manipulated by the optimizer itself (it used to
+    # be a fixed input), alongside Rxn Temp, H2/C2, C4/C2, C6/C2, ICA,
+    # Al/Ti and Catalyst rate — i.e. every lever the process actually has,
+    # per the "manipulate H2/C2, Al/Ti, comonomer ratios, Rxn T and C2
+    # pressure" requirement.
 
     def objective(x):
 
         rxn_temp = x[0]
-        h2_c2 = x[1]
-        c4_c2 = x[2]
-        c6_c2 = x[3]
-        ica = x[4]
-        al_ti = x[5]
-        cat_rate = x[6]
+        c2_pressure = x[1]
+        h2_c2 = x[2]
+        c4_c2 = x[3]
+        c6_c2 = x[4]
+        ica = x[5]
+        al_ti = x[6]
+        cat_rate = x[7]
 
         input_vector = [
 
@@ -297,6 +302,7 @@ def optimize_process(
     bounds = [
 
         (80,110),      # Rxn Temp. oC
+        (15,25),       # C2 Pressure kg/cm2
         (0.05,0.50),   # H2/C2
         (0.0,0.40),    # C4/C2
         (0.0,0.15),    # C6/C2
@@ -321,6 +327,67 @@ def optimize_process(
     )
 
     return result
+
+
+# =====================================================
+# PATENT-BASED (STATISTICAL) GRADE-TRANSITION SETPOINTS
+# =====================================================
+# Rule-based setpoint calculator following the grade-transition logic
+# described in US 5,627,242: given the outgoing (Product 1) and the
+# desired incoming (Product 2) grade, it derives interim controller
+# setpoints for reaction temperature, melt index and the rate-limiting
+# reactant partial pressure, without calling either ML model.
+
+def patent_grade_transition_setpoints(
+
+    p1_temp,
+    p1_mi,
+    p1_pressure,
+    p2_temp,
+    p2_mi,
+    mi_pct,
+    temp_delta,
+    pressure_delta
+
+):
+
+    # Step 1: initial reaction-temperature setpoint change — drop
+    # immediately to Product 2's temperature only if it is lower than
+    # Product 1's; otherwise leave the setpoint at Product 1's value
+    # for now (it will be trimmed precisely in step 3).
+    temp_setpoint_initial = p2_temp if p2_temp < p1_temp else p1_temp
+
+    # Step 2: melt index setpoint, 0-150% higher or 0-70% lower than
+    # the desired Product 2 melt index (mi_pct is constrained by the
+    # UI slider to [-70, 150]).
+    mi_setpoint = p2_mi * (1 + mi_pct / 100.0)
+
+    # Step 3 & 4 both depend on whether Product 2's MI is higher or
+    # lower than Product 1's MI ("... and vice versa" in the patent
+    # text).
+    mi_increasing = p2_mi > p1_mi
+
+    # Step 3: refined reaction-temperature setpoint, 1-15 C above the
+    # desired Product 2 temperature if MI is increasing, else below.
+    temp_setpoint_refined = (
+        p2_temp + temp_delta if mi_increasing else p2_temp - temp_delta
+    )
+
+    # Step 4: rate-limiting reactant partial pressure setpoint, 1-25
+    # (psig) below Product 1's pressure if MI is increasing, else above.
+    pressure_setpoint = (
+        p1_pressure - pressure_delta if mi_increasing else p1_pressure + pressure_delta
+    )
+
+    return {
+
+        "temp_setpoint_initial": temp_setpoint_initial,
+        "mi_setpoint": mi_setpoint,
+        "temp_setpoint_refined": temp_setpoint_refined,
+        "pressure_setpoint": pressure_setpoint,
+        "mi_increasing": mi_increasing
+
+    }
 
 # =====================================================
 # HEADER
@@ -426,7 +493,7 @@ border-top:4px solid #1E88E5;
 <div style="
 position:absolute;
 left:406px;
-top:294px;
+top:295px;
 width:0;height:0;
 border-top:7px solid transparent;
 border-bottom:7px solid transparent;
@@ -492,7 +559,7 @@ background:#1976D2;
 
 <div style="
 position:absolute;
-left:462px;
+left:463px;
 top:96px;
 width:0;height:0;
 border-left:7px solid transparent;
@@ -526,7 +593,7 @@ background:#8E24AA;
 
 <div style="
 position:absolute;
-left:542px;
+left:543px;
 top:96px;
 width:0;height:0;
 border-left:7px solid transparent;
@@ -557,52 +624,22 @@ height:360px;
 border:4px solid #1976D2;
 border-radius:25px;
 overflow:hidden;
-background:white;
+background:#FAFAFA;
+display:flex;
+align-items:center;
+justify-content:center;
+text-align:center;
 ">
 
-<!-- Disengaging Zone -->
-
 <div style="
-height:90px;
-background:#E3F2FD;
-border-bottom:3px dashed #1976D2;
-text-align:center;
-padding-top:15px;
-font-weight:bold;
 color:#0D47A1;
-">
-DISENGAGING<br>ZONE
-</div>
-
-<!-- Fluidized Bed -->
-
-<div style="
-height:270px;
-background:
-radial-gradient(circle at 20% 90%, white 5px, transparent 6px),
-radial-gradient(circle at 40% 75%, white 6px, transparent 7px),
-radial-gradient(circle at 70% 82%, white 5px, transparent 6px),
-radial-gradient(circle at 60% 60%, white 7px, transparent 8px),
-linear-gradient(to top,#4CAF50,#81C784,#A5D6A7);
-text-align:center;
-padding-top:25px;
-color:white;
 font-weight:bold;
-font-size:14px;
+font-size:15px;
 ">
-
-FLUIDIZED BED
-
+REACTOR
 <br><br>
-
 Rxn Temperature<br>
 {st.session_state.rxn_temp:.1f} &deg;C
-
-<br><br>
-
-C2 Pressure<br>
-{st.session_state.c2_pressure:.1f} kg/cm&sup2;
-
 </div>
 
 </div>
@@ -622,7 +659,7 @@ background:red;
 <div style="
 position:absolute;
 left:465px;
-top:460px;
+top:470px;
 width:0;height:0;
 border-left:7px solid transparent;
 border-right:7px solid transparent;
@@ -656,7 +693,7 @@ background:orange;
 <div style="
 position:absolute;
 left:545px;
-top:460px;
+top:470px;
 width:0;height:0;
 border-left:7px solid transparent;
 border-right:7px solid transparent;
@@ -688,8 +725,8 @@ border-top:4px solid #1E88E5;
 
 <div style="
 position:absolute;
-left:818px;
-top:284px;
+left:806px;
+top:285px;
 width:0;height:0;
 border-top:7px solid transparent;
 border-bottom:7px solid transparent;
@@ -699,7 +736,7 @@ border-left:14px solid #1E88E5;
 <div style="
 position:absolute;
 left:640px;
-top:195px;
+top:170px;
 color:#0D47A1;
 font-size:14px;
 ">
@@ -929,35 +966,68 @@ with tab2:
 
         )
 
+        fig = px.scatter(
+
+            df,
+
+            x=x_var,
+
+            y=y_var,
+
+            title=f"{x_var} vs {y_var}"
+
+        )
+
+        # NOTE: we deliberately do NOT use plotly express's built-in
+        # trendline="ols" here, since that requires the "statsmodels"
+        # package which isn't installed in this environment and throws
+        # a ModuleNotFoundError at render time. Instead we fit a simple
+        # OLS line ourselves with numpy and add it as an extra trace,
+        # which needs nothing beyond numpy/pandas.
         if add_trendline:
 
-            fig = px.scatter(
+            x_num = pd.to_numeric(df[x_var], errors="coerce")
+            y_num = pd.to_numeric(df[y_var], errors="coerce")
 
-                df,
+            mask = x_num.notna() & y_num.notna()
 
-                x=x_var,
+            if mask.sum() >= 2 and x_num[mask].nunique() > 1:
 
-                y=y_var,
+                x_vals = x_num[mask].to_numpy()
+                y_vals = y_num[mask].to_numpy()
 
-                trendline="ols",
+                slope, intercept = np.polyfit(x_vals, y_vals, 1)
 
-                title=f"{x_var} vs {y_var}"
+                y_hat = slope * x_vals + intercept
+                ss_res = np.sum((y_vals - y_hat) ** 2)
+                ss_tot = np.sum((y_vals - y_vals.mean()) ** 2)
+                r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
 
-            )
+                x_line = np.linspace(x_vals.min(), x_vals.max(), 100)
+                y_line = slope * x_line + intercept
 
-        else:
+                fig.add_scatter(
 
-            fig = px.scatter(
+                    x=x_line,
 
-                df,
+                    y=y_line,
 
-                x=x_var,
+                    mode="lines",
 
-                y=y_var,
+                    name=f"OLS fit (R\u00b2={r2:.3f})",
 
-                title=f"{x_var} vs {y_var}"
+                    line=dict(color="red", dash="dash")
 
-            )
+                )
+
+            else:
+
+                st.warning(
+
+                    "Not enough numeric data in the selected columns to "
+                    "fit a trendline."
+
+                )
 
         st.plotly_chart(
 
@@ -1139,12 +1209,33 @@ with tab3:
         "APC Optimizer"
     )
 
-    col1,col2 = st.columns(2)
+    optimizer_mode = st.radio(
 
-    with col1:
+        "Optimization Mode",
 
-        st.markdown(
-            "### Current Plant Conditions"
+        [
+            "Based on Data (ML Optimizer)",
+            "Based on Statistics (Patent Rule-Based)"
+        ],
+
+        key="optimizer_mode",
+
+        horizontal=True
+
+    )
+
+    st.markdown("---")
+
+    # ==========================================
+    # MODE 1 — DATA-DRIVEN ML OPTIMIZER
+    # ==========================================
+
+    if optimizer_mode == "Based on Data (ML Optimizer)":
+
+        st.caption(
+            "Searches Rxn Temp, C2 Pressure, H2/C2, C4/C2, C6/C2, ICA and "
+            "Al/Ti (with a fixed C2 feed rate) using the XGBoost + ANN "
+            "ensemble to hit your target product quality."
         )
 
         feed_rate = st.number_input(
@@ -1157,245 +1248,101 @@ with tab3:
 
         )
 
-        c2_pressure = st.number_input(
-
-            "C2 Pressure (kg/cm²)",
-
-            value=20.0,
-
-            key="opt_c2_pressure"
-
-        )
-
-    with col2:
-
-        st.markdown(
-            "### Target Product Properties"
-        )
-
-        target_mfi = st.number_input(
-
-            "Target MFI @2.16 kg/cm²",
-
-            value=5.0,
-
-            key="opt_target_mfi"
-
-        )
-
-        target_productivity = st.number_input(
-
-            "Target Productivity (kg PE/g cat)",
-
-            value=7.0,
-
-            key="opt_target_productivity"
-
-        )
-
-        target_density = st.number_input(
-
-            "Target Density (g/cc)",
-
-            value=0.935,
-
-            format="%.4f",
-
-            key="opt_target_density"
-
-        )
-
-    st.markdown("---")
-
-    run_button = st.button(
-
-        "Optimize Process",
-
-        key="optimize_button"
-
-    )
-
-    if run_button:
-
-        with st.spinner(
-            "Running optimization..."
-        ):
-
-            result = optimize_process(
-
-                feed_rate,
-
-                c2_pressure,
-
-                target_mfi,
-
-                target_productivity,
-
-                target_density
-
-            )
-
-        best_temp = result.x[0]
-
-        best_h2_c2 = result.x[1]
-
-        best_c4_c2 = result.x[2]
-
-        best_c6_c2 = result.x[3]
-
-        best_ica = result.x[4]
-
-        best_al_ti = result.x[5]
-
-        best_cat_rate = result.x[6]
-
-        optimal_input = [
-
-            best_temp,
-
-            c2_pressure,
-
-            best_h2_c2,
-
-            best_c4_c2,
-
-            best_c6_c2,
-
-            best_ica,
-
-            best_al_ti,
-
-            feed_rate,
-
-            best_cat_rate
-
-        ]
-
-        pred,std,preds = ensemble_predict(
-            optimal_input
-        )
-
-        st.markdown("---")
-
         col1,col2 = st.columns(2)
 
         with col1:
 
-            st.subheader(
-                "Recommended Setpoints"
+            st.markdown(
+                "### Target Product Properties"
             )
 
-            st.metric(
+            target_mfi = st.number_input(
 
-                "Rxn Temperature (°C)",
+                "Target MFI @2.16 kg/cm²",
 
-                f"{best_temp:.2f}"
+                value=5.0,
 
-            )
-
-            st.metric(
-
-                "H2/C2 ratio",
-
-                f"{best_h2_c2:.3f}"
+                key="opt_target_mfi"
 
             )
 
-            st.metric(
+            target_productivity = st.number_input(
 
-                "C4/C2 ratio",
+                "Target Productivity (kg PE/g cat)",
 
-                f"{best_c4_c2:.3f}"
+                value=7.0,
 
-            )
-
-            st.metric(
-
-                "C6/C2 ratio",
-
-                f"{best_c6_c2:.3f}"
-
-            )
-
-            st.metric(
-
-                "ICA (mol %)",
-
-                f"{best_ica:.2f}"
-
-            )
-
-            st.metric(
-
-                "Al/Ti ratio",
-
-                f"{best_al_ti:.1f}"
-
-            )
-
-            st.metric(
-
-                "Catalyst Rate (kg/h)",
-
-                f"{best_cat_rate:.2f}"
+                key="opt_target_productivity"
 
             )
 
         with col2:
 
-            st.subheader(
-                "Predicted Quality"
+            st.markdown(
+                "### &nbsp;"
             )
 
-            st.metric(
+            target_density = st.number_input(
 
-                "Predicted MFI @2.16 kg/cm²",
+                "Target Density (g/cc)",
 
-                f"{pred[0]:.2f}"
+                value=0.935,
 
-            )
+                format="%.4f",
 
-            st.metric(
-
-                "Predicted Productivity (kg PE/g cat)",
-
-                f"{pred[1]:.2f}"
-
-            )
-
-            st.metric(
-
-                "Predicted Density (g/cc)",
-
-                f"{pred[2]:.4f}"
+                key="opt_target_density"
 
             )
 
         st.markdown("---")
 
-        comparison = pd.DataFrame({
+        run_button = st.button(
 
-            "Variable":[
+            "Optimize Process",
 
-                "Rxn Temperature (°C)",
+            key="optimize_button"
 
-                "H2/C2",
+        )
 
-                "C4/C2",
+        if run_button:
 
-                "C6/C2",
+            with st.spinner(
+                "Running optimization..."
+            ):
 
-                "ICA (mol %)",
+                result = optimize_process(
 
-                "Al/Ti",
+                    feed_rate,
 
-                "Catalyst Rate (kg/h)"
+                    target_mfi,
 
-            ],
+                    target_productivity,
 
-            "Recommended":[
+                    target_density
+
+                )
+
+            best_temp = result.x[0]
+
+            best_c2_pressure = result.x[1]
+
+            best_h2_c2 = result.x[2]
+
+            best_c4_c2 = result.x[3]
+
+            best_c6_c2 = result.x[4]
+
+            best_ica = result.x[5]
+
+            best_al_ti = result.x[6]
+
+            best_cat_rate = result.x[7]
+
+            optimal_input = [
 
                 best_temp,
+
+                best_c2_pressure,
 
                 best_h2_c2,
 
@@ -1407,39 +1354,490 @@ with tab3:
 
                 best_al_ti,
 
+                feed_rate,
+
                 best_cat_rate
 
             ]
 
-        })
+            pred,std,preds = ensemble_predict(
+                optimal_input
+            )
 
-        st.subheader(
-            "Optimization Summary"
+            st.markdown("---")
+
+            col1,col2 = st.columns(2)
+
+            with col1:
+
+                st.subheader(
+                    "Recommended Setpoints"
+                )
+
+                st.metric(
+
+                    "Rxn Temperature (°C)",
+
+                    f"{best_temp:.2f}"
+
+                )
+
+                st.metric(
+
+                    "C2 Pressure (kg/cm²)",
+
+                    f"{best_c2_pressure:.2f}"
+
+                )
+
+                st.metric(
+
+                    "H2/C2 ratio",
+
+                    f"{best_h2_c2:.3f}"
+
+                )
+
+                st.metric(
+
+                    "C4/C2 ratio",
+
+                    f"{best_c4_c2:.3f}"
+
+                )
+
+                st.metric(
+
+                    "C6/C2 ratio",
+
+                    f"{best_c6_c2:.3f}"
+
+                )
+
+                st.metric(
+
+                    "ICA (mol %)",
+
+                    f"{best_ica:.2f}"
+
+                )
+
+                st.metric(
+
+                    "Al/Ti ratio",
+
+                    f"{best_al_ti:.1f}"
+
+                )
+
+                st.metric(
+
+                    "Catalyst Rate (kg/h)",
+
+                    f"{best_cat_rate:.2f}"
+
+                )
+
+            with col2:
+
+                st.subheader(
+                    "Predicted Quality"
+                )
+
+                st.metric(
+
+                    "Predicted MFI @2.16 kg/cm²",
+
+                    f"{pred[0]:.2f}"
+
+                )
+
+                st.metric(
+
+                    "Predicted Productivity (kg PE/g cat)",
+
+                    f"{pred[1]:.2f}"
+
+                )
+
+                st.metric(
+
+                    "Predicted Density (g/cc)",
+
+                    f"{pred[2]:.4f}"
+
+                )
+
+            st.markdown("---")
+
+            comparison = pd.DataFrame({
+
+                "Variable":[
+
+                    "Rxn Temperature (°C)",
+
+                    "C2 Pressure (kg/cm²)",
+
+                    "H2/C2",
+
+                    "C4/C2",
+
+                    "C6/C2",
+
+                    "ICA (mol %)",
+
+                    "Al/Ti",
+
+                    "Catalyst Rate (kg/h)"
+
+                ],
+
+                "Recommended":[
+
+                    best_temp,
+
+                    best_c2_pressure,
+
+                    best_h2_c2,
+
+                    best_c4_c2,
+
+                    best_c6_c2,
+
+                    best_ica,
+
+                    best_al_ti,
+
+                    best_cat_rate
+
+                ]
+
+            })
+
+            st.subheader(
+                "Optimization Summary"
+            )
+
+            st.dataframe(
+
+                comparison,
+
+                use_container_width=True
+
+            )
+
+            confidence = np.exp(
+                -np.mean(std/np.abs(pred).clip(1e-6))
+            ) * 100
+
+            st.subheader(
+                "Model Confidence"
+            )
+
+            st.progress(
+                int(min(confidence,100))
+            )
+
+            st.write(
+                f"{confidence:.1f}%"
+            )
+
+    # ==========================================
+    # MODE 2 — PATENT-BASED (STATISTICAL) GRADE TRANSITION
+    # ==========================================
+
+    else:
+
+        st.caption(
+            "Rule-based grade-transition setpoints, following the "
+            "methodology of US 5,627,242: compares the outgoing "
+            "(Product 1) and desired incoming (Product 2) grade and "
+            "derives interim temperature, melt index and rate-limiting "
+            "reactant partial-pressure setpoints. No ML model is used "
+            "in this mode."
         )
 
-        st.dataframe(
+        col1,col2 = st.columns(2)
 
-            comparison,
+        with col1:
 
-            use_container_width=True
+            st.markdown(
+                "### Product 1 (Outgoing Grade)"
+            )
+
+            p1_temp = st.number_input(
+
+                "Product 1 Rxn Temperature (°C)",
+
+                value=95.0,
+
+                key="p1_temp"
+
+            )
+
+            p1_mi = st.number_input(
+
+                "Product 1 Melt Index",
+
+                value=5.0,
+
+                key="p1_mi"
+
+            )
+
+            p1_pressure = st.number_input(
+
+                "Product 1 Rate-Limiting Reactant Partial Pressure (psig)",
+
+                value=280.0,
+
+                key="p1_pressure"
+
+            )
+
+            p1_density = st.number_input(
+
+                "Product 1 Density (g/cc)",
+
+                value=0.935,
+
+                format="%.4f",
+
+                key="p1_density"
+
+            )
+
+        with col2:
+
+            st.markdown(
+                "### Product 2 (Desired Incoming Grade)"
+            )
+
+            p2_temp = st.number_input(
+
+                "Product 2 Desired Rxn Temperature (°C)",
+
+                value=90.0,
+
+                key="p2_temp"
+
+            )
+
+            p2_mi = st.number_input(
+
+                "Product 2 Desired Melt Index",
+
+                value=8.0,
+
+                key="p2_mi"
+
+            )
+
+            p2_density = st.number_input(
+
+                "Product 2 Desired Density (g/cc)",
+
+                value=0.930,
+
+                format="%.4f",
+
+                key="p2_density"
+
+            )
+
+        st.markdown("---")
+
+        st.markdown(
+            "### Transition Rule Parameters"
+        )
+
+        st.caption(
+            "These sliders pick a value within the ranges the patent "
+            "allows for each setpoint — the endpoints are the bounds "
+            "given in the patent, not the recommended value itself."
+        )
+
+        col3,col4,col5 = st.columns(3)
+
+        with col3:
+
+            mi_pct = st.slider(
+
+                "Melt Index setpoint deviation (%)",
+
+                min_value=-70,
+
+                max_value=150,
+
+                value=0,
+
+                key="mi_pct",
+
+                help="0-150% higher, or 0-70% lower, than the desired "
+                     "Product 2 melt index."
+
+            )
+
+        with col4:
+
+            temp_delta = st.slider(
+
+                "Reaction Temp trim (°C)",
+
+                min_value=1,
+
+                max_value=15,
+
+                value=5,
+
+                key="temp_delta",
+
+                help="1-15 °C above/below Product 2's desired "
+                     "temperature, depending on the MI direction."
+
+            )
+
+        with col5:
+
+            pressure_delta = st.slider(
+
+                "Rate-Limiting Reactant Pressure trim (psig)",
+
+                min_value=1,
+
+                max_value=25,
+
+                value=10,
+
+                key="pressure_delta",
+
+                help="1-25 psig below/above Product 1's pressure, "
+                     "depending on the MI direction."
+
+            )
+
+        acceptable_tol = st.slider(
+
+            "Acceptable range around target MI / Density (%)",
+
+            min_value=1,
+
+            max_value=20,
+
+            value=5,
+
+            key="acceptable_tol"
 
         )
 
-        confidence = np.exp(
-            -np.mean(std/np.abs(pred).clip(1e-6))
-        ) * 100
+        st.markdown("---")
 
-        st.subheader(
-            "Model Confidence"
+        calc_button = st.button(
+
+            "Calculate Transition Setpoints",
+
+            key="patent_calc_button"
+
         )
 
-        st.progress(
-            int(min(confidence,100))
-        )
+        if calc_button:
 
-        st.write(
-            f"{confidence:.1f}%"
-        )
+            setpoints = patent_grade_transition_setpoints(
+
+                p1_temp,
+
+                p1_mi,
+
+                p1_pressure,
+
+                p2_temp,
+
+                p2_mi,
+
+                mi_pct,
+
+                temp_delta,
+
+                pressure_delta
+
+            )
+
+            st.markdown("---")
+
+            direction_note = (
+                "Product 2 MI is higher than Product 1 MI" if setpoints["mi_increasing"]
+                else "Product 2 MI is lower than Product 1 MI (or equal)"
+            )
+
+            st.info(f"Direction rule in effect: **{direction_note}**")
+
+            col1,col2 = st.columns(2)
+
+            with col1:
+
+                st.subheader(
+                    "Step 1 — Initial Setpoints"
+                )
+
+                st.metric(
+
+                    "Initial Rxn Temp Setpoint (°C)",
+
+                    f"{setpoints['temp_setpoint_initial']:.2f}"
+
+                )
+
+                st.metric(
+
+                    "Melt Index Setpoint",
+
+                    f"{setpoints['mi_setpoint']:.2f}"
+
+                )
+
+            with col2:
+
+                st.subheader(
+                    "Steps 3 & 4 — Refined Setpoints"
+                )
+
+                st.metric(
+
+                    "Refined Rxn Temp Setpoint (°C)",
+
+                    f"{setpoints['temp_setpoint_refined']:.2f}"
+
+                )
+
+                st.metric(
+
+                    "Rate-Limiting Reactant Pressure Setpoint (psig)",
+
+                    f"{setpoints['pressure_setpoint']:.2f}"
+
+                )
+
+            st.markdown("---")
+
+            st.subheader(
+                "Step 5 — Maintain Until Within Acceptable Range"
+            )
+
+            mi_low = p2_mi * (1 - acceptable_tol / 100.0)
+            mi_high = p2_mi * (1 + acceptable_tol / 100.0)
+            density_low = p2_density * (1 - acceptable_tol / 100.0)
+            density_high = p2_density * (1 + acceptable_tol / 100.0)
+
+            st.write(
+
+                f"Hold the setpoints above until the polymerization "
+                f"product's **average melt index** settles between "
+                f"**{mi_low:.2f} and {mi_high:.2f}**, and its **average "
+                f"density** settles between **{density_low:.4f} and "
+                f"{density_high:.4f} g/cc** (±{acceptable_tol}% around "
+                f"the Product 2 targets)."
+
+            )
 
 # =====================================================
 # MODEL INSIGHTS
