@@ -8,6 +8,7 @@ import torch.nn as nn
 import json
 from scipy.optimize import differential_evolution
 import plotly.express as px
+import plotly.graph_objects as go
 from sklearn.ensemble import IsolationForest
 
 # =====================================================
@@ -127,10 +128,28 @@ target_names = [
 ]
 
 
-def compute_rolling_features(df, feature_names, window):
+def compute_rolling_features(df, feature_names, window, group_col="Grade"):
 
-    roll_mean = df[feature_names].rolling(window).mean()
-    roll_std = df[feature_names].rolling(window).std()
+    # The data is arranged grade-wise (contiguous blocks per grade). A plain
+    # rolling window would blend the tail of one grade with the head of the
+    # next, so every grade changeover would look like a false "anomaly".
+    # Instead we compute the rolling mean/std *within each grade block*, so
+    # a point is only flagged when it deviates from that grade's own normal
+    # operating window -- i.e. anomaly detection is grade-aware.
+    if group_col in df.columns:
+
+        grouped = df.groupby(group_col, sort=False)[feature_names]
+
+        roll_mean = grouped.rolling(window, min_periods=window).mean()
+        roll_std = grouped.rolling(window, min_periods=window).std()
+
+        roll_mean = roll_mean.reset_index(level=0, drop=True).sort_index()
+        roll_std = roll_std.reset_index(level=0, drop=True).sort_index()
+
+    else:
+
+        roll_mean = df[feature_names].rolling(window).mean()
+        roll_std = df[feature_names].rolling(window).std()
 
     roll_mean.columns = [f"{c}_roll_mean" for c in feature_names]
     roll_std.columns = [f"{c}_roll_std" for c in feature_names]
@@ -143,17 +162,50 @@ def compute_rolling_features(df, feature_names, window):
 @st.cache_resource
 def train_ts_anomaly_model(df, window, contamination):
 
+    # One IsolationForest *per grade*, not one pooled model. Different
+    # grades legitimately run at different setpoints (e.g. Rxn Temp ~95C
+    # for one grade vs ~105C for another) — a single pooled model would
+    # flag an entire small-volume grade as "anomalous" just for operating
+    # at its own normal condition, which isn't a real anomaly, just a
+    # different grade. Training within each grade means a point is only
+    # flagged for deviating from *that grade's own* operating history.
+
     feats = compute_rolling_features(df, feature_names, window)
     feats = feats.dropna()
 
-    model = IsolationForest(
-        contamination=contamination,
-        random_state=42
-    )
+    models = {}
 
-    model.fit(feats)
+    if "Grade" in df.columns:
 
-    return model, feats
+        grades_for_feats = df.loc[feats.index, "Grade"]
+
+        for g in grades_for_feats.unique():
+
+            idx_g = grades_for_feats[grades_for_feats == g].index
+            feats_g = feats.loc[idx_g]
+
+            if len(feats_g) < 2:
+                continue
+
+            m = IsolationForest(
+                contamination=contamination,
+                random_state=42
+            )
+
+            m.fit(feats_g)
+            models[g] = m
+
+    else:
+
+        m = IsolationForest(
+            contamination=contamination,
+            random_state=42
+        )
+
+        m.fit(feats)
+        models["__all__"] = m
+
+    return models, feats
 
 
 @st.cache_data
@@ -164,15 +216,45 @@ def get_feature_correlations(df, feature_names):
 
 def run_ts_anomaly_detection(df, window=20, contamination=0.03):
 
-    model, feats = train_ts_anomaly_model(df, window, contamination)
+    models, feats = train_ts_anomaly_model(df, window, contamination)
 
-    scores = model.decision_function(feats)
-    preds = model.predict(feats)
+    scores = pd.Series(index=feats.index, dtype=float)
+    preds = pd.Series(index=feats.index, dtype=int)
+
+    if "Grade" in df.columns:
+
+        grades_for_feats = df.loc[feats.index, "Grade"]
+
+        for g, model in models.items():
+
+            idx_g = grades_for_feats[grades_for_feats == g].index
+
+            if len(idx_g) == 0:
+                continue
+
+            feats_g = feats.loc[idx_g]
+            scores.loc[idx_g] = model.decision_function(feats_g)
+            preds.loc[idx_g] = model.predict(feats_g)
+
+    else:
+
+        model = models["__all__"]
+        scores.loc[:] = model.decision_function(feats)
+        preds.loc[:] = model.predict(feats)
 
     results = df.loc[feats.index].copy()
-    results["anomaly_score"] = scores
-    results["is_anomaly"] = preds == -1
-    results["health"] = ((scores + 0.5) * 100).clip(0, 100)
+    results["anomaly_score"] = scores.values
+    results["is_anomaly"] = preds.values == -1
+    results["health"] = ((scores.values + 0.5) * 100).clip(0, 100)
+
+    # Grade transition points: the first sample of each grade block has no
+    # prior-grade history to build a rolling window from (min_periods=window
+    # means it's simply NaN and dropped upstream), so anything left in
+    # `results` is scored purely against its *own* grade's history.
+    if "Grade" in results.columns:
+        results["is_grade_change"] = results["Grade"].ne(results["Grade"].shift())
+    else:
+        results["is_grade_change"] = False
 
     # Per-variable deviation, in rolling-window std units, at every point.
     # This is what lets us explain *why* a point was flagged: whichever
@@ -567,7 +649,7 @@ st.sidebar.markdown("---")
 # =====================================================
 # TABS
 # =====================================================
-tab1,tab2,tab3,tab4,tab5 = st.tabs(
+tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs(
 
     [
 
@@ -579,7 +661,9 @@ tab1,tab2,tab3,tab4,tab5 = st.tabs(
 
         "Model diagnostics",
 
-        "Anomaly Detection"
+        "Anomaly Detection",
+
+        "Changeover Economics"
 
 
     ]
@@ -652,7 +736,7 @@ border-left:14px solid #1E88E5;
 <div style="
 position:absolute;
 left:45px;
-top:240px;
+top:220px;
 color:#0D47A1;
 font-size:14px;
 ">
@@ -662,13 +746,16 @@ P = {st.session_state.c2_pressure:.1f} kg/cm&sup2;
 </div>
 
 <!-- ================= COMONOMER (C4/C2, C6/C2 ratios) ================= -->
-<!-- horizontal line from x=140 to x=420 (reactor left edge) -->
+<!-- horizontal line from x=40 to x=420 (reactor left edge) -->
+<!-- Same start x and width as the C2 FEED line above, so both feed -->
+<!-- lines are the same length; label sits a consistent 30px below its -->
+<!-- own line, mirroring the 30px gap C2 FEED's label keeps above its line. -->
 
 <div style="
 position:absolute;
-left:140px;
+left:40px;
 top:380px;
-width:280px;
+width:380px;
 border-top:3px solid green;
 "></div>
 
@@ -684,8 +771,8 @@ border-left:14px solid green;
 
 <div style="
 position:absolute;
-left:145px;
-top:395px;
+left:45px;
+top:410px;
 color:green;
 font-size:13px;
 ">
@@ -1047,15 +1134,46 @@ with tab2:
 
         )
 
-        fig = px.line(
+        color_by_grade = st.checkbox(
 
-            df,
+            "Color by Grade",
 
-            y=selected_column,
+            value="Grade" in df.columns and selected_column != "Grade",
 
-            title=f"{selected_column} Trend"
+            key="trend_color_by_grade"
 
         )
+
+        if color_by_grade and "Grade" in df.columns:
+
+            # Data is arranged grade-wise (contiguous blocks), so coloring
+            # by Grade here makes each grade's operating campaign visually
+            # distinct instead of one blended line.
+            fig = px.line(
+
+                df,
+
+                x=df.index,
+
+                y=selected_column,
+
+                color="Grade",
+
+                title=f"{selected_column} Trend by Grade"
+
+            )
+
+        else:
+
+            fig = px.line(
+
+                df,
+
+                y=selected_column,
+
+                title=f"{selected_column} Trend"
+
+            )
 
         fig.update_layout(
 
@@ -2276,10 +2394,12 @@ with tab5:
     )
 
     st.caption(
-        "Rolling-window Isolation Forest — each point is scored using the "
-        "mean and standard deviation of every variable over a sliding "
-        "window, so drifts and pattern shifts are caught, not just "
-        "single-row spikes."
+        "Rolling-window Isolation Forest, trained separately per grade — "
+        "each point is scored using the mean and standard deviation of "
+        "every variable over a sliding window *within its own grade's "
+        "operating history*, so drifts and pattern shifts are caught "
+        "relative to that grade's normal operation, not flagged just for "
+        "being a different (smaller-volume) grade."
     )
 
     col1,col2 = st.columns(2)
@@ -2388,6 +2508,43 @@ with tab5:
 
     st.markdown("---")
 
+    if "Grade" in results.columns:
+
+        st.markdown("### Anomalies by Grade")
+
+        st.caption(
+            "Rolling statistics reset at every grade boundary, so each "
+            "point is judged against its *own* grade's normal operating "
+            "window rather than the whole mixed-grade dataset."
+        )
+
+        grade_summary = results.groupby("Grade", sort=False).agg(
+            Points=("is_anomaly", "size"),
+            Anomalies=("is_anomaly", "sum"),
+        )
+
+        grade_summary["Anomaly rate (%)"] = (
+            100 * grade_summary["Anomalies"] / grade_summary["Points"]
+        ).round(1)
+
+        st.dataframe(
+            grade_summary,
+            use_container_width=True
+        )
+
+        if "Seeded_Anomaly" in results.columns and results["Seeded_Anomaly"].any():
+
+            seeded = results[results["Seeded_Anomaly"]]
+            caught = int(seeded["is_anomaly"].sum())
+            total_seeded = len(seeded)
+
+            st.info(
+                f"**Validation:** {caught}/{total_seeded} deliberately "
+                f"seeded per-grade anomalies were caught at the current "
+                f"window/contamination setting — use this to sanity-check "
+                f"the detector before trusting it on live data."
+            )
+
     st.markdown("### Health Score Over Time")
 
     fig_health = px.line(
@@ -2409,6 +2566,18 @@ with tab5:
         yaxis_title="Health Score"
 
     )
+
+    if "Grade" in results.columns:
+
+        for _, row in results[results["is_grade_change"]].iterrows():
+
+            fig_health.add_vline(
+                x=row.name,
+                line_dash="dot",
+                line_color="gray",
+                annotation_text=row["Grade"],
+                annotation_position="top"
+            )
 
     anomaly_points = results[results["is_anomaly"]]
 
@@ -2605,6 +2774,277 @@ with tab5:
             f"or decoupled at this point, since that's usually what "
             f"separates a process drift from a sensor glitch."
 
+        )
+
+# =====================================================
+# PLANT ECONOMICS OF THE GRADE CHANGEOVER
+# =====================================================
+# The dummy data has no timestamps, so a *historical* changeover cost
+# can't be reconstructed from it. What we build instead is the standard
+# costing model plants use for this, pre-filled with sensible defaults
+# pulled from the data (grade list, average throughput), and left fully
+# editable so a real plant can drop in its own numbers:
+#
+#   1. Identify the transition window (DCS/LIMS timestamps in a real
+#      plant): start = first setpoint move off Product 1's targets;
+#      end = first sustained in-spec reading of Product 2.
+#   2. Everything produced inside that window that fails spec is
+#      "changeover material" — valued at scrap/regrind/downgrade price
+#      instead of prime price. That value gap, times the kg made during
+#      the transition, is the core cost.
+#   3. APC (via the grade-transition optimizer in the Optimizer tab)
+#      earns its keep by shortening the transition window, not by
+#      changing the price gap — so the savings lever is duration.
+
+with tab6:
+
+    st.subheader("Plant Economics of the Grade Changeover")
+
+    st.caption(
+        "Cost of a grade-to-grade transition, and the savings available "
+        "from an APC-assisted (shorter) transition vs. a manual one. "
+        "Every number below is editable — defaults are pre-filled from "
+        "the plant data where possible."
+    )
+
+    with st.expander("Methodology — how this is built", expanded=False):
+
+        st.markdown(
+            "**1. Bound the transition window.** In a live plant this "
+            "comes from DCS/LIMS timestamps: start = first controller "
+            "move away from the outgoing grade's setpoints; end = first "
+            "lab result of the incoming grade that holds in-spec "
+            "(MFI and density within tolerance) for a sustained period. "
+            "This dashboard's *Optimizer → Grade Transition* tab already "
+            "computes the target setpoints for that move.\n\n"
+            "**2. Value the transition material.** Everything produced "
+            "between start and end that doesn't meet either grade's spec "
+            "is sold as off-spec/regrind at a discount to prime price — "
+            "that value gap, times the transition kg, is the direct cost.\n\n"
+            "**3. Add the extras.** Any additional catalyst/comonomer "
+            "dosed to force the setpoint move faster, plus any rate "
+            "cutback held during the transition for stability.\n\n"
+            "**4. Compare manual vs. APC-assisted duration.** Since price "
+            "gap and throughput are fixed, transition *duration* is the "
+            "lever APC pulls — a shorter window means fewer off-spec kg "
+            "for the same changeover."
+        )
+
+    st.markdown("### 1. Transition")
+
+    grade_list = sorted(df["Grade"].dropna().unique().tolist()) if "Grade" in df.columns else []
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        from_grade = st.selectbox(
+            "Outgoing grade",
+            grade_list,
+            index=0 if grade_list else None,
+            key="econ_from_grade"
+        )
+
+    with col2:
+
+        to_grade_options = [g for g in grade_list if g != from_grade] or grade_list
+        to_grade = st.selectbox(
+            "Incoming grade",
+            to_grade_options,
+            index=0 if to_grade_options else None,
+            key="econ_to_grade"
+        )
+
+    default_throughput = float(df["Feed rate (kg/h)"].mean()) if "Feed rate (kg/h)" in df.columns else 5000.0
+
+    st.markdown("### 2. Rates, Duration & Price Assumptions")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+
+        throughput = st.number_input(
+            "Plant throughput during transition (kg/h)",
+            min_value=0.0,
+            value=round(default_throughput, 0),
+            step=100.0,
+            key="econ_throughput"
+        )
+
+        changeovers_per_year = st.number_input(
+            "Changeovers of this type per year",
+            min_value=0,
+            value=50,
+            step=1,
+            key="econ_freq"
+        )
+
+    with c2:
+
+        manual_hours = st.number_input(
+            "Manual transition duration (h)",
+            min_value=0.1,
+            value=4.0,
+            step=0.5,
+            key="econ_manual_hours"
+        )
+
+        apc_hours = st.number_input(
+            "APC-assisted transition duration (h)",
+            min_value=0.1,
+            value=1.5,
+            step=0.5,
+            key="econ_apc_hours"
+        )
+
+        if apc_hours > manual_hours:
+            st.warning(
+                "APC duration is set longer than the manual duration — "
+                "check the inputs; savings will show as negative."
+            )
+
+    with c3:
+
+        prime_price = st.number_input(
+            f"Prime price of {to_grade} ($/kg)" if to_grade else "Prime price ($/kg)",
+            min_value=0.0,
+            value=1.20,
+            step=0.05,
+            key="econ_prime_price"
+        )
+
+        offspec_recovery_pct = st.slider(
+            "Off-spec material realizes (% of prime price)",
+            min_value=0,
+            max_value=100,
+            value=60,
+            key="econ_offspec_pct"
+        )
+
+    extra_cost_per_changeover = st.number_input(
+        "Extra catalyst/comonomer/analyzer cost per changeover ($)",
+        min_value=0.0,
+        value=500.0,
+        step=50.0,
+        key="econ_extra_cost"
+    )
+
+    st.markdown("### 3. Cost of a Single Changeover")
+
+    value_gap_per_kg = prime_price * (1 - offspec_recovery_pct / 100)
+
+    offspec_kg_manual = throughput * manual_hours
+    offspec_kg_apc = throughput * apc_hours
+    kg_saved = max(offspec_kg_manual - offspec_kg_apc, 0.0)
+
+    cost_manual = offspec_kg_manual * value_gap_per_kg + extra_cost_per_changeover
+    cost_apc = offspec_kg_apc * value_gap_per_kg + extra_cost_per_changeover
+    savings_per_changeover = cost_manual - cost_apc
+
+    m1, m2, m3, m4 = st.columns(4)
+
+    with m1:
+        st.metric("Off-spec kg (manual)", f"{offspec_kg_manual:,.0f} kg")
+
+    with m2:
+        st.metric("Off-spec kg (APC-assisted)", f"{offspec_kg_apc:,.0f} kg", delta=f"-{kg_saved:,.0f} kg")
+
+    with m3:
+        st.metric("Cost per changeover (manual)", f"${cost_manual:,.0f}")
+
+    with m4:
+        st.metric(
+            "Savings per changeover",
+            f"${savings_per_changeover:,.0f}",
+            delta=f"{(savings_per_changeover/cost_manual*100 if cost_manual else 0):.0f}% vs manual"
+        )
+
+    fig_bridge = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=["absolute", "relative", "total"],
+        x=["Manual transition cost", "APC duration saving", "APC-assisted cost"],
+        y=[cost_manual, -savings_per_changeover, cost_apc],
+        text=[f"${cost_manual:,.0f}", f"-${savings_per_changeover:,.0f}", f"${cost_apc:,.0f}"],
+        textposition="outside",
+        connector={"line": {"color": "gray"}},
+        decreasing={"marker": {"color": "#2E7D32"}},
+        totals={"marker": {"color": "#1565C0"}},
+        increasing={"marker": {"color": "#C62828"}}
+    ))
+
+    fig_bridge.update_layout(
+        title=f"Cost Bridge — {from_grade} → {to_grade} Changeover" if from_grade and to_grade else "Cost Bridge",
+        yaxis_title="Cost ($)"
+    )
+
+    st.plotly_chart(fig_bridge, use_container_width=True)
+
+    st.markdown("### 4. Annualized Impact")
+
+    annual_savings = savings_per_changeover * changeovers_per_year
+    annual_cost_manual = cost_manual * changeovers_per_year
+    annual_offspec_kg_saved = kg_saved * changeovers_per_year
+
+    a1, a2, a3 = st.columns(3)
+
+    with a1:
+        st.metric("Annual changeover cost (manual basis)", f"${annual_cost_manual:,.0f}")
+
+    with a2:
+        st.metric("Annual off-spec kg avoided", f"{annual_offspec_kg_saved:,.0f} kg")
+
+    with a3:
+        st.metric("Annual savings from APC-assisted changeovers", f"${annual_savings:,.0f}")
+
+    with st.expander("Optional: payback on an APC implementation cost"):
+
+        capex = st.number_input(
+            "One-time APC implementation cost ($)",
+            min_value=0.0,
+            value=150000.0,
+            step=10000.0,
+            key="econ_capex"
+        )
+
+        if annual_savings > 0:
+
+            payback_months = capex / (annual_savings / 12)
+
+            st.success(
+                f"At ${annual_savings:,.0f}/year in savings, a ${capex:,.0f} "
+                f"implementation pays back in **{payback_months:.1f} months**."
+            )
+
+        else:
+
+            st.info(
+                "Annual savings must be positive to compute a payback period "
+                "— check the manual vs. APC duration inputs above."
+            )
+
+    if grade_list:
+
+        st.markdown("### 5. Per-Grade Price Reference (editable)")
+
+        st.caption(
+            "Default prices are placeholders — replace with actual "
+            "commercial prices. This table is for reference; the "
+            "calculation above uses the single incoming-grade price set "
+            "in section 2."
+        )
+
+        if "econ_price_table" not in st.session_state:
+
+            st.session_state.econ_price_table = pd.DataFrame({
+                "Grade": grade_list,
+                "Prime price ($/kg)": [1.20] * len(grade_list)
+            })
+
+        st.data_editor(
+            st.session_state.econ_price_table,
+            use_container_width=True,
+            num_rows="fixed",
+            key="econ_price_editor"
         )
 
 st.markdown("---")
