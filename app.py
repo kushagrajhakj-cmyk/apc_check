@@ -649,7 +649,7 @@ st.sidebar.markdown("---")
 # =====================================================
 # TABS
 # =====================================================
-tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs(
+tab1,tab2,tab3,tab4,tab5,tab6,tab7 = st.tabs(
 
     [
 
@@ -660,6 +660,8 @@ tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs(
         "Optimizer",
 
         "Model diagnostics",
+
+        "Pilot Plant Validation",
 
         "Anomaly Detection",
 
@@ -2387,7 +2389,45 @@ with tab4:
 # ANOMALY DETECTION (time-series aware)
 # =====================================================
 
+# =====================================================
+# PILOT PLANT VALIDATION (coming soon)
+# =====================================================
+# Placeholder tab: real pilot-plant trial data isn't wired in yet. Sits
+# right after Model Diagnostics because pilot-scale validation is the
+# next rigor step before the ensemble's predictions can be trusted for
+# monitoring (Anomaly Detection) or business decisions (Changeover
+# Economics) — it's the bridge between "the models agree with each
+# other" and "the models agree with a physical trial run".
+
 with tab5:
+
+    st.subheader("Pilot Plant Validation")
+
+    st.caption(
+        "Cross-checking the ensemble's predictions against real "
+        "pilot-scale trial runs, before those predictions are trusted "
+        "for live monitoring or economic decisions."
+    )
+
+    _, gif_col, _ = st.columns([1, 2, 1])
+
+    with gif_col:
+
+        st.image(
+            "https://media0.giphy.com/media/v1.Y2lkPTc5MGI3NjExMmFzNDZ4Znp0"
+            "ZTI2YWdqdmJhc3IzMm1lbWN2a3ltdTI0cHo5eXBiMCZlcD12MV9naWZzX3NlYXJ"
+            "jaCZjdD1n/fUZHXuE94BN2wtSbUS/giphy.gif",
+            use_container_width=True
+        )
+
+        st.markdown(
+            "<h3 style='text-align:center;color:#555;'>"
+            "Will be live soon — please wait, our awesome scientists "
+            "are working on it! 🧪</h3>",
+            unsafe_allow_html=True
+        )
+
+with tab6:
 
     st.subheader(
         "Time-Series Anomaly Detection"
@@ -2796,7 +2836,7 @@ with tab5:
 #      earns its keep by shortening the transition window, not by
 #      changing the price gap — so the savings lever is duration.
 
-with tab6:
+with tab7:
 
     st.subheader("Plant Economics of the Grade Changeover")
 
