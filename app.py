@@ -332,11 +332,23 @@ def optimize_process(
 # =====================================================
 # PATENT-BASED (STATISTICAL) GRADE-TRANSITION SETPOINTS
 # =====================================================
-# Rule-based setpoint calculator following the grade-transition logic
-# described in US 5,627,242: given the outgoing (Product 1) and the
-# desired incoming (Product 2) grade, it derives interim controller
-# setpoints for reaction temperature, melt index and the rate-limiting
-# reactant partial pressure, without calling either ML model.
+# Setpoint calculator following the grade-transition logic described in
+# US 5,627,242. The patent fixes two things: (1) which DIRECTION each
+# setpoint moves (e.g. "above Product 2's temp if MI is increasing, else
+# below"), and (2) the LEGAL RANGE it's allowed to move within (e.g.
+# "1-15 C"). It does not say exactly where in that range to land — that's
+# an optimization problem, not something to ask the user to guess with a
+# slider. So here we fix the direction/bounds from the patent text, then
+# use the trained ML ensemble to search inside those bounds for the
+# temperature and pressure setpoints that get closest to Product 2's
+# actual target quality (given whatever H2/C2, comonomer ratios, ICA and
+# Al/Ti are currently running). The Melt Index setpoint (step 2) isn't a
+# physical model input, so instead of guessing it either, we set it to
+# whatever MI the model predicts the optimized temp/pressure will
+# actually produce, clipped into the patent's legal range for that
+# setpoint.
+
+PSIG_TO_KGCM2 = 0.0703069
 
 def patent_grade_transition_setpoints(
 
@@ -345,9 +357,14 @@ def patent_grade_transition_setpoints(
     p1_pressure,
     p2_temp,
     p2_mi,
-    mi_pct,
-    temp_delta,
-    pressure_delta
+    p2_density,
+    feed_rate,
+    h2_c2,
+    c4_c2,
+    c6_c2,
+    ica,
+    al_ti,
+    cat_rate
 
 ):
 
@@ -357,35 +374,130 @@ def patent_grade_transition_setpoints(
     # for now (it will be trimmed precisely in step 3).
     temp_setpoint_initial = p2_temp if p2_temp < p1_temp else p1_temp
 
-    # Step 2: melt index setpoint, 0-150% higher or 0-70% lower than
-    # the desired Product 2 melt index (mi_pct is constrained by the
-    # UI slider to [-70, 150]).
-    mi_setpoint = p2_mi * (1 + mi_pct / 100.0)
-
-    # Step 3 & 4 both depend on whether Product 2's MI is higher or
-    # lower than Product 1's MI ("... and vice versa" in the patent
-    # text).
+    # Steps 2-4 all depend on whether Product 2's MI is higher or lower
+    # than Product 1's MI ("... and vice versa" in the patent text).
     mi_increasing = p2_mi > p1_mi
 
+    # The patent's legal ranges for steps 3 and 4 (magnitude only — the
+    # direction above/below is fixed by mi_increasing).
+    temp_delta_bounds = (1.0, 15.0)
+    pressure_delta_bounds = (1.0, 25.0)
+
+    def objective(x):
+
+        temp_delta, pressure_delta = x
+
+        temp_refined = (
+            p2_temp + temp_delta if mi_increasing else p2_temp - temp_delta
+        )
+        pressure_sp = (
+            p1_pressure - pressure_delta if mi_increasing else p1_pressure + pressure_delta
+        )
+
+        input_vector = [
+
+            temp_refined,
+            pressure_sp * PSIG_TO_KGCM2,
+            h2_c2,
+            c4_c2,
+            c6_c2,
+            ica,
+            al_ti,
+            feed_rate,
+            cat_rate
+
+        ]
+
+        pred,_,_ = ensemble_predict(input_vector)
+        mfi_pred, _, density_pred = pred
+
+        return (
+
+            ((mfi_pred - p2_mi) / max(p2_mi,1e-6)) ** 2
+
+            +
+
+            ((density_pred - p2_density) / max(p2_density,1e-6)) ** 2
+
+        )
+
+    result = differential_evolution(
+
+        objective,
+
+        [temp_delta_bounds, pressure_delta_bounds],
+
+        maxiter=40,
+
+        popsize=12,
+
+        seed=42
+
+    )
+
+    best_temp_delta, best_pressure_delta = result.x
+
     # Step 3: refined reaction-temperature setpoint, 1-15 C above the
-    # desired Product 2 temperature if MI is increasing, else below.
+    # desired Product 2 temperature if MI is increasing, else below —
+    # with the magnitude picked by the search above.
     temp_setpoint_refined = (
-        p2_temp + temp_delta if mi_increasing else p2_temp - temp_delta
+        p2_temp + best_temp_delta if mi_increasing else p2_temp - best_temp_delta
     )
 
     # Step 4: rate-limiting reactant partial pressure setpoint, 1-25
-    # (psig) below Product 1's pressure if MI is increasing, else above.
+    # psig below Product 1's pressure if MI is increasing, else above.
     pressure_setpoint = (
-        p1_pressure - pressure_delta if mi_increasing else p1_pressure + pressure_delta
+        p1_pressure - best_pressure_delta if mi_increasing else p1_pressure + best_pressure_delta
     )
+
+    # What does the model think steps 3+4 will actually produce?
+    final_input = [
+
+        temp_setpoint_refined,
+        pressure_setpoint * PSIG_TO_KGCM2,
+        h2_c2,
+        c4_c2,
+        c6_c2,
+        ica,
+        al_ti,
+        feed_rate,
+        cat_rate
+
+    ]
+
+    pred, std, _ = ensemble_predict(final_input)
+    predicted_mfi, predicted_productivity, predicted_density = pred
+
+    # Step 2: melt index setpoint. The patent allows 0-150% higher, or
+    # 0-70% lower, than the Product 2 target — i.e. a legal setpoint
+    # range of [p2_mi, 2.5*p2_mi] if MI is increasing, or
+    # [0.3*p2_mi, p2_mi] if decreasing. Rather than asking the user to
+    # pick a point in that range, we set it to whatever the model
+    # predicts steps 3+4 will actually deliver, clipped into the legal
+    # range (so it's always a defensible, patent-compliant value, but
+    # driven by the model's prediction rather than a guess).
+    if mi_increasing:
+        mi_low, mi_high = p2_mi, p2_mi * 2.5
+    else:
+        mi_low, mi_high = p2_mi * 0.3, p2_mi
+
+    mi_setpoint = min(max(predicted_mfi, mi_low), mi_high)
+    mi_pct = (mi_setpoint / p2_mi - 1) * 100.0
 
     return {
 
         "temp_setpoint_initial": temp_setpoint_initial,
         "mi_setpoint": mi_setpoint,
+        "mi_pct": mi_pct,
         "temp_setpoint_refined": temp_setpoint_refined,
+        "temp_delta": best_temp_delta,
         "pressure_setpoint": pressure_setpoint,
-        "mi_increasing": mi_increasing
+        "pressure_delta": best_pressure_delta,
+        "mi_increasing": mi_increasing,
+        "predicted_mfi": predicted_mfi,
+        "predicted_productivity": predicted_productivity,
+        "predicted_density": predicted_density,
+        "predicted_std": std
 
     }
 
@@ -1549,12 +1661,13 @@ with tab3:
     else:
 
         st.caption(
-            "Rule-based grade-transition setpoints, following the "
-            "methodology of US 5,627,242: compares the outgoing "
-            "(Product 1) and desired incoming (Product 2) grade and "
-            "derives interim temperature, melt index and rate-limiting "
-            "reactant partial-pressure setpoints. No ML model is used "
-            "in this mode."
+            "Grade-transition setpoints following the methodology of "
+            "US 5,627,242: the patent fixes which direction each "
+            "setpoint moves and the legal range it can move within — "
+            "the trained ML ensemble then searches inside that range "
+            "for the setpoint that actually gets closest to Product 2's "
+            "target quality (using whatever H2/C2, comonomer ratios, "
+            "ICA and Al/Ti are currently set on the Live PFD tab)."
         )
 
         col1,col2 = st.columns(2)
@@ -1648,73 +1761,8 @@ with tab3:
         st.markdown("---")
 
         st.markdown(
-            "### Transition Rule Parameters"
+            "### Acceptance Criteria"
         )
-
-        st.caption(
-            "These sliders pick a value within the ranges the patent "
-            "allows for each setpoint — the endpoints are the bounds "
-            "given in the patent, not the recommended value itself."
-        )
-
-        col3,col4,col5 = st.columns(3)
-
-        with col3:
-
-            mi_pct = st.slider(
-
-                "Melt Index setpoint deviation (%)",
-
-                min_value=-70,
-
-                max_value=150,
-
-                value=0,
-
-                key="mi_pct",
-
-                help="0-150% higher, or 0-70% lower, than the desired "
-                     "Product 2 melt index."
-
-            )
-
-        with col4:
-
-            temp_delta = st.slider(
-
-                "Reaction Temp trim (°C)",
-
-                min_value=1,
-
-                max_value=15,
-
-                value=5,
-
-                key="temp_delta",
-
-                help="1-15 °C above/below Product 2's desired "
-                     "temperature, depending on the MI direction."
-
-            )
-
-        with col5:
-
-            pressure_delta = st.slider(
-
-                "Rate-Limiting Reactant Pressure trim (psig)",
-
-                min_value=1,
-
-                max_value=25,
-
-                value=10,
-
-                key="pressure_delta",
-
-                help="1-25 psig below/above Product 1's pressure, "
-                     "depending on the MI direction."
-
-            )
 
         acceptable_tol = st.slider(
 
@@ -1726,7 +1774,11 @@ with tab3:
 
             value=5,
 
-            key="acceptable_tol"
+            key="acceptable_tol",
+
+            help="How close average MI and density need to settle to "
+                 "the Product 2 targets before the transition counts "
+                 "as complete (Step 5)."
 
         )
 
@@ -1734,7 +1786,7 @@ with tab3:
 
         calc_button = st.button(
 
-            "Calculate Transition Setpoints",
+            "Search Transition Setpoints",
 
             key="patent_calc_button"
 
@@ -1742,25 +1794,41 @@ with tab3:
 
         if calc_button:
 
-            setpoints = patent_grade_transition_setpoints(
+            with st.spinner(
 
-                p1_temp,
+                "Searching within the patent's legal setpoint ranges..."
 
-                p1_mi,
+            ):
 
-                p1_pressure,
+                setpoints = patent_grade_transition_setpoints(
 
-                p2_temp,
+                    p1_temp,
 
-                p2_mi,
+                    p1_mi,
 
-                mi_pct,
+                    p1_pressure,
 
-                temp_delta,
+                    p2_temp,
 
-                pressure_delta
+                    p2_mi,
 
-            )
+                    p2_density,
+
+                    st.session_state.feed_rate,
+
+                    st.session_state.h2_c2,
+
+                    st.session_state.c4_c2,
+
+                    st.session_state.c6_c2,
+
+                    st.session_state.ica_mol,
+
+                    st.session_state.al_ti,
+
+                    st.session_state.cat_rate
+
+                )
 
             st.markdown("---")
 
@@ -1771,49 +1839,80 @@ with tab3:
 
             st.info(f"Direction rule in effect: **{direction_note}**")
 
+            st.markdown("### Step 1 — Initial Temperature Setpoint")
+
+            st.caption(
+                "Drop immediately to Product 2's temperature only if it's "
+                "lower than Product 1's; otherwise hold at Product 1's "
+                "temperature until Step 3 refines it."
+            )
+
+            st.metric(
+
+                "Initial Rxn Temp Setpoint (°C)",
+
+                f"{setpoints['temp_setpoint_initial']:.2f}"
+
+            )
+
+            st.markdown("### Step 2 — Melt Index Setpoint")
+
+            st.caption(
+                "Legal range is 0-150% higher (if MI is increasing) or "
+                "0-70% lower (if decreasing) than the Product 2 target. "
+                "Set to whatever MI the model predicts Steps 3-4 will "
+                "actually produce, clipped into that legal range."
+            )
+
+            st.metric(
+
+                "Melt Index Setpoint",
+
+                f"{setpoints['mi_setpoint']:.2f}",
+
+                delta=f"{setpoints['mi_pct']:+.0f}% vs Product 2 target"
+
+            )
+
             col1,col2 = st.columns(2)
 
             with col1:
 
-                st.subheader(
-                    "Step 1 — Initial Setpoints"
-                )
+                st.markdown("### Step 3 — Refined Temperature Setpoint")
 
-                st.metric(
-
-                    "Initial Rxn Temp Setpoint (°C)",
-
-                    f"{setpoints['temp_setpoint_initial']:.2f}"
-
-                )
-
-                st.metric(
-
-                    "Melt Index Setpoint",
-
-                    f"{setpoints['mi_setpoint']:.2f}"
-
-                )
-
-            with col2:
-
-                st.subheader(
-                    "Steps 3 & 4 — Refined Setpoints"
+                st.caption(
+                    "Searched within 1-15°C above Product 2's "
+                    "temperature (MI increasing) or below (MI "
+                    "decreasing) for the value closest to target quality."
                 )
 
                 st.metric(
 
                     "Refined Rxn Temp Setpoint (°C)",
 
-                    f"{setpoints['temp_setpoint_refined']:.2f}"
+                    f"{setpoints['temp_setpoint_refined']:.2f}",
 
+                    delta=f"{setpoints['temp_delta']:.1f}°C trim (of 1-15°C range)"
+
+                )
+
+            with col2:
+
+                st.markdown("### Step 4 — Reactant Pressure Setpoint")
+
+                st.caption(
+                    "Searched within 1-25 psig below Product 1's "
+                    "pressure (MI increasing) or above (MI decreasing) "
+                    "for the value closest to target quality."
                 )
 
                 st.metric(
 
                     "Rate-Limiting Reactant Pressure Setpoint (psig)",
 
-                    f"{setpoints['pressure_setpoint']:.2f}"
+                    f"{setpoints['pressure_setpoint']:.2f}",
+
+                    delta=f"{setpoints['pressure_delta']:.1f} psig trim (of 1-25 psig range)"
 
                 )
 
@@ -1838,6 +1937,99 @@ with tab3:
                 f"the Product 2 targets)."
 
             )
+
+            # ==========================================
+            # WHAT THE SEARCH ACTUALLY EXPECTS TO HAPPEN
+            # ==========================================
+            # This is the same ML ensemble the search above already used
+            # to score every candidate (temp_delta, pressure_delta) pair
+            # — we're just surfacing its prediction for the winning pair,
+            # rather than re-running it separately as an afterthought.
+
+            st.markdown("---")
+
+            st.markdown("### Predicted Outcome of Steps 3 & 4")
+
+            st.caption(
+
+                "What the ML ensemble predicts Steps 3-4's setpoints "
+                "will actually produce, given the current H2/C2, "
+                "comonomer ratios, ICA, Al/Ti, feed rate and catalyst "
+                "rate from the Live PFD tab — this is the same model "
+                "the search above optimized against."
+
+            )
+
+            cc1,cc2,cc3 = st.columns(3)
+
+            with cc1:
+
+                st.metric(
+
+                    "Predicted MFI @2.16 kg/cm²",
+
+                    f"{setpoints['predicted_mfi']:.2f}",
+
+                    delta=f"target {p2_mi:.2f}"
+
+                )
+
+            with cc2:
+
+                st.metric(
+
+                    "Predicted Productivity (kg PE/g cat)",
+
+                    f"{setpoints['predicted_productivity']:.2f}"
+
+                )
+
+            with cc3:
+
+                st.metric(
+
+                    "Predicted Density (g/cc)",
+
+                    f"{setpoints['predicted_density']:.4f}",
+
+                    delta=f"target {p2_density:.4f}"
+
+                )
+
+            mi_in_range = mi_low <= setpoints["predicted_mfi"] <= mi_high
+            density_in_range = density_low <= setpoints["predicted_density"] <= density_high
+
+            if mi_in_range and density_in_range:
+
+                st.success(
+
+                    "Predicted MI and density both fall inside the Step "
+                    "5 acceptable range for Product 2 — this search "
+                    "found a setpoint combination consistent with a "
+                    "completed transition."
+
+                )
+
+            else:
+
+                off_target = []
+                if not mi_in_range:
+                    off_target.append("MI")
+                if not density_in_range:
+                    off_target.append("density")
+
+                st.warning(
+
+                    f"Even the best setpoints found within the patent's "
+                    f"legal ranges still leave predicted {' and '.join(off_target)} "
+                    f"outside the Step 5 acceptable range — the H2/C2, "
+                    f"comonomer ratios, ICA or Al/Ti (which the patent "
+                    f"doesn't constrain) likely need adjusting too, e.g. "
+                    f"with the data-driven optimizer mode."
+
+                )
+
+
 
 # =====================================================
 # MODEL INSIGHTS
