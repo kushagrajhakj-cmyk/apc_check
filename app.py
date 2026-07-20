@@ -2014,7 +2014,7 @@ with tab3:
     "Reading AIChE Journal, Oct. 1992, Vol. 38, No. 10, pp. 1564–1576... "
     "Reading AIChE Journal, Mar. 1994, Vol. 40, No. 3, pp. 506–520... "
     "Reading Patent US5627242A... "
-    "Product 2 MI is lower than Product 1 MI (or equal)."
+    "Product 2 MI is lower than Product 1 MI (or equal)." )
 )
 
             st.info(f"Direction rule in effect: **{direction_note}**")
