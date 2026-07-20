@@ -2004,18 +2004,10 @@ with tab3:
 
             st.markdown("---")
 
-           direction_note = (
-    "Reading AIChE Journal, Oct. 1992, Vol. 38, No. 10, pp. 1564–1576... "
-    "Reading AIChE Journal, Mar. 1994, Vol. 40, No. 3, pp. 506–520... "
-    "Reading Patent US5627242A... "
-    "Product 2 MI is higher than Product 1 MI."
-    if setpoints["mi_increasing"]
-    else
-    "Reading AIChE Journal, Oct. 1992, Vol. 38, No. 10, pp. 1564–1576... "
-    "Reading AIChE Journal, Mar. 1994, Vol. 40, No. 3, pp. 506–520... "
-    "Reading Patent US5627242A... "
-    "Product 2 MI is lower than Product 1 MI (or equal)." )
-)
+            direction_note = (
+                "Product 2 MI is higher than Product 1 MI, reading patent US5627242A..." if setpoints["mi_increasing"]
+                else "Product 2 MI is lower than Product 1 MI (or equal), reading patent US5627242A... "
+            )
 
             st.info(f"Direction rule in effect: **{direction_note}**")
 
