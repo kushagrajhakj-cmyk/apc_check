@@ -336,27 +336,19 @@ def optimize_process(
 # US 5,627,242. The patent fixes two things: (1) which DIRECTION each
 # setpoint moves (e.g. "above Product 2's temp if MI is increasing, else
 # below"), and (2) the LEGAL RANGE it's allowed to move within (e.g.
-# "1-15 C"). It does not say exactly where in that range to land, and it
-# says nothing at all about H2/C2, comonomer ratios, ICA or Al/Ti — those
-# are free process levers the patent doesn't touch.
-#
-# So this does a single joint search: temp_delta and pressure_delta are
-# bounded and directed exactly as the patent specifies, while H2/C2,
-# C4/C2, C6/C2, ICA, Al/Ti and catalyst rate are free to roam their full
-# normal operating range. The trained ML ensemble scores every candidate
-# combination, and the loss is weighted so MFI and density (the two
-# properties that actually define whether a grade is "in spec") dominate
-# the search, while productivity is only weighted lightly — it's allowed
-# to be traded off, not protected.
+# "1-15 C"). It does not say exactly where in that range to land — that's
+# an optimization problem, not something to ask the user to guess with a
+# slider. So here we fix the direction/bounds from the patent text, then
+# use the trained ML ensemble to search inside those bounds for the
+# temperature and pressure setpoints that get closest to Product 2's
+# actual target quality (given whatever H2/C2, comonomer ratios, ICA and
+# Al/Ti are currently running). The Melt Index setpoint (step 2) isn't a
+# physical model input, so instead of guessing it either, we set it to
+# whatever MI the model predicts the optimized temp/pressure will
+# actually produce, clipped into the patent's legal range for that
+# setpoint.
 
 PSIG_TO_KGCM2 = 0.0703069
-
-# Relative-error weights in the search objective. MFI and density define
-# grade spec; productivity is a cost/throughput concern that's explicitly
-# allowed to be compromised here, so it gets a much smaller weight.
-MFI_WEIGHT = 1.0
-DENSITY_WEIGHT = 1.0
-PRODUCTIVITY_WEIGHT = 0.05
 
 def patent_grade_transition_setpoints(
 
@@ -367,7 +359,12 @@ def patent_grade_transition_setpoints(
     p2_mi,
     p2_density,
     feed_rate,
-    target_productivity
+    h2_c2,
+    c4_c2,
+    c6_c2,
+    ica,
+    al_ti,
+    cat_rate
 
 ):
 
@@ -381,26 +378,14 @@ def patent_grade_transition_setpoints(
     # than Product 1's MI ("... and vice versa" in the patent text).
     mi_increasing = p2_mi > p1_mi
 
-    # x = [temp_delta, pressure_delta, h2_c2, c4_c2, c6_c2, ica, al_ti, cat_rate]
-    # The first two are patent-bounded (direction fixed by mi_increasing);
-    # the rest are free levers searched over their normal operating range
-    # (same ranges the data-driven optimizer uses).
-    bounds = [
-
-        (1.0, 15.0),     # temp_delta (patent: 1-15 C)
-        (1.0, 25.0),     # pressure_delta (patent: 1-25 psig)
-        (0.05, 0.50),    # H2/C2
-        (0.0, 0.40),     # C4/C2
-        (0.0, 0.15),     # C6/C2
-        (0.0, 12.0),     # ICA mol %
-        (20.0, 120.0),   # Al/Ti
-        (5.0, 15.0)      # Catalyst rate (kg/h)
-
-    ]
+    # The patent's legal ranges for steps 3 and 4 (magnitude only — the
+    # direction above/below is fixed by mi_increasing).
+    temp_delta_bounds = (1.0, 15.0)
+    pressure_delta_bounds = (1.0, 25.0)
 
     def objective(x):
 
-        temp_delta, pressure_delta, h2_c2, c4_c2, c6_c2, ica, al_ti, cat_rate = x
+        temp_delta, pressure_delta = x
 
         temp_refined = (
             p2_temp + temp_delta if mi_increasing else p2_temp - temp_delta
@@ -424,19 +409,15 @@ def patent_grade_transition_setpoints(
         ]
 
         pred,_,_ = ensemble_predict(input_vector)
-        mfi_pred, prod_pred, density_pred = pred
+        mfi_pred, _, density_pred = pred
 
         return (
 
-            MFI_WEIGHT * ((mfi_pred - p2_mi) / max(p2_mi,1e-6)) ** 2
+            ((mfi_pred - p2_mi) / max(p2_mi,1e-6)) ** 2
 
             +
 
-            DENSITY_WEIGHT * ((density_pred - p2_density) / max(p2_density,1e-6)) ** 2
-
-            +
-
-            PRODUCTIVITY_WEIGHT * ((prod_pred - target_productivity) / max(target_productivity,1e-6)) ** 2
+            ((density_pred - p2_density) / max(p2_density,1e-6)) ** 2
 
         )
 
@@ -444,27 +425,17 @@ def patent_grade_transition_setpoints(
 
         objective,
 
-        bounds,
+        [temp_delta_bounds, pressure_delta_bounds],
 
-        maxiter=60,
+        maxiter=40,
 
-        popsize=15,
+        popsize=12,
 
         seed=42
 
     )
 
-    (
-        best_temp_delta,
-        best_pressure_delta,
-        best_h2_c2,
-        best_c4_c2,
-        best_c6_c2,
-        best_ica,
-        best_al_ti,
-        best_cat_rate
-
-    ) = result.x
+    best_temp_delta, best_pressure_delta = result.x
 
     # Step 3: refined reaction-temperature setpoint, 1-15 C above the
     # desired Product 2 temperature if MI is increasing, else below —
@@ -479,19 +450,18 @@ def patent_grade_transition_setpoints(
         p1_pressure - best_pressure_delta if mi_increasing else p1_pressure + best_pressure_delta
     )
 
-    # What does the model think this whole combination will actually
-    # produce?
+    # What does the model think steps 3+4 will actually produce?
     final_input = [
 
         temp_setpoint_refined,
         pressure_setpoint * PSIG_TO_KGCM2,
-        best_h2_c2,
-        best_c4_c2,
-        best_c6_c2,
-        best_ica,
-        best_al_ti,
+        h2_c2,
+        c4_c2,
+        c6_c2,
+        ica,
+        al_ti,
         feed_rate,
-        best_cat_rate
+        cat_rate
 
     ]
 
@@ -503,9 +473,9 @@ def patent_grade_transition_setpoints(
     # range of [p2_mi, 2.5*p2_mi] if MI is increasing, or
     # [0.3*p2_mi, p2_mi] if decreasing. Rather than asking the user to
     # pick a point in that range, we set it to whatever the model
-    # predicts the optimized combination will actually deliver, clipped
-    # into the legal range (so it's always a defensible, patent-
-    # compliant value, but driven by the search rather than a guess).
+    # predicts steps 3+4 will actually deliver, clipped into the legal
+    # range (so it's always a defensible, patent-compliant value, but
+    # driven by the model's prediction rather than a guess).
     if mi_increasing:
         mi_low, mi_high = p2_mi, p2_mi * 2.5
     else:
@@ -524,19 +494,12 @@ def patent_grade_transition_setpoints(
         "pressure_setpoint": pressure_setpoint,
         "pressure_delta": best_pressure_delta,
         "mi_increasing": mi_increasing,
-        "h2_c2": best_h2_c2,
-        "c4_c2": best_c4_c2,
-        "c6_c2": best_c6_c2,
-        "ica": best_ica,
-        "al_ti": best_al_ti,
-        "cat_rate": best_cat_rate,
         "predicted_mfi": predicted_mfi,
         "predicted_productivity": predicted_productivity,
         "predicted_density": predicted_density,
         "predicted_std": std
 
     }
-
 
 # =====================================================
 # HEADER
@@ -1699,13 +1662,12 @@ with tab3:
 
         st.caption(
             "Grade-transition setpoints following the methodology of "
-            "US 5,627,242: the patent fixes which direction the "
-            "temperature and pressure setpoints move and the legal "
-            "range they can move within. Everything the patent doesn't "
-            "constrain — H2/C2, comonomer ratios, ICA and Al/Ti — is "
-            "searched freely by the ML ensemble alongside them, with "
-            "MFI and density weighted heavily and productivity allowed "
-            "to be traded off."
+            "US 5,627,242: the patent fixes which direction each "
+            "setpoint moves and the legal range it can move within — "
+            "the trained ML ensemble then searches inside that range "
+            "for the setpoint that actually gets closest to Product 2's "
+            "target quality (using whatever H2/C2, comonomer ratios, "
+            "ICA and Al/Ti are currently set on the Live PFD tab)."
         )
 
         col1,col2 = st.columns(2)
@@ -1799,43 +1761,6 @@ with tab3:
         st.markdown("---")
 
         st.markdown(
-            "### Search Settings"
-        )
-
-        col3,col4 = st.columns(2)
-
-        with col3:
-
-            search_feed_rate = st.number_input(
-
-                "C2 Feed Rate (kg/h)",
-
-                value=10000.0,
-
-                key="patent_feed_rate"
-
-            )
-
-        with col4:
-
-            soft_target_productivity = st.number_input(
-
-                "Target Productivity (kg PE/g cat) — soft target",
-
-                value=7.0,
-
-                key="patent_target_productivity",
-
-                help="Used only as a light tiebreaker in the search — "
-                     "MFI and density are weighted 20x higher, so "
-                     "productivity is free to come in below this if "
-                     "that's what hitting spec requires."
-
-            )
-
-        st.markdown("---")
-
-        st.markdown(
             "### Acceptance Criteria"
         )
 
@@ -1871,8 +1796,7 @@ with tab3:
 
             with st.spinner(
 
-                "Searching temperature, pressure and free process levers "
-                "within their allowed ranges..."
+                "Searching within the patent's legal setpoint ranges..."
 
             ):
 
@@ -1890,9 +1814,19 @@ with tab3:
 
                     p2_density,
 
-                    search_feed_rate,
+                    st.session_state.feed_rate,
 
-                    soft_target_productivity
+                    st.session_state.h2_c2,
+
+                    st.session_state.c4_c2,
+
+                    st.session_state.c6_c2,
+
+                    st.session_state.ica_mol,
+
+                    st.session_state.al_ti,
+
+                    st.session_state.cat_rate
 
                 )
 
@@ -1984,50 +1918,6 @@ with tab3:
 
             st.markdown("---")
 
-            st.markdown("### Supporting Levers (Not Constrained by the Patent)")
-
-            st.caption(
-
-                "The patent's rules only cover temperature, MI and "
-                "reactant pressure. These are the H2/C2, comonomer "
-                "ratios, ICA and Al/Ti values the search found — "
-                "searched jointly with Steps 3-4 above, weighting MFI "
-                "and density heavily and letting productivity flex."
-
-            )
-
-            lc1,lc2,lc3,lc4,lc5 = st.columns(5)
-
-            with lc1:
-
-                st.metric("H2/C2", f"{setpoints['h2_c2']:.3f}")
-
-            with lc2:
-
-                st.metric("C4/C2", f"{setpoints['c4_c2']:.3f}")
-
-            with lc3:
-
-                st.metric("C6/C2", f"{setpoints['c6_c2']:.3f}")
-
-            with lc4:
-
-                st.metric("ICA (mol %)", f"{setpoints['ica']:.2f}")
-
-            with lc5:
-
-                st.metric("Al/Ti", f"{setpoints['al_ti']:.1f}")
-
-            st.metric(
-
-                "Catalyst Rate (kg/h)",
-
-                f"{setpoints['cat_rate']:.2f}"
-
-            )
-
-            st.markdown("---")
-
             st.subheader(
                 "Step 5 — Maintain Until Within Acceptable Range"
             )
@@ -2052,21 +1942,21 @@ with tab3:
             # WHAT THE SEARCH ACTUALLY EXPECTS TO HAPPEN
             # ==========================================
             # This is the same ML ensemble the search above already used
-            # to score every candidate (temp_delta, pressure_delta,
-            # H2/C2, C4/C2, C6/C2, ICA, Al/Ti, cat_rate) combination —
-            # we're just surfacing its prediction for the winning
-            # combination, rather than re-running it separately.
+            # to score every candidate (temp_delta, pressure_delta) pair
+            # — we're just surfacing its prediction for the winning pair,
+            # rather than re-running it separately as an afterthought.
 
             st.markdown("---")
 
-            st.markdown("### Predicted Outcome of the Full Setpoint Combination")
+            st.markdown("### Predicted Outcome of Steps 3 & 4")
 
             st.caption(
 
-                "What the ML ensemble predicts the searched combination "
-                "above (Steps 3-4 plus the supporting levers) will "
-                "actually produce — this is the same model the search "
-                "optimized against."
+                "What the ML ensemble predicts Steps 3-4's setpoints "
+                "will actually produce, given the current H2/C2, "
+                "comonomer ratios, ICA, Al/Ti, feed rate and catalyst "
+                "rate from the Live PFD tab — this is the same model "
+                "the search above optimized against."
 
             )
 
