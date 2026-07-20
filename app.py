@@ -1470,7 +1470,7 @@ with tab3:
 
         [
             "Based on Data (ML Optimizer)",
-            "Based on Statistics (Patent Rule-Based)"
+            "Based on Data + Knowledge base"
         ],
 
         key="optimizer_mode",
@@ -1805,8 +1805,8 @@ with tab3:
 
         st.caption(
             "Grade-transition setpoints following the methodology of "
-            "US 5,627,242: the patent fixes which direction the "
-            "temperature and pressure setpoints move and the legal "
+            "published patents and research papers: to fix which direction the "
+            "temperature and pressure setpoints move and the "
             "range they can move within. Everything the patent doesn't "
             "constrain — H2/C2, comonomer ratios, ICA and Al/Ti — is "
             "searched freely by the ML ensemble alongside them, with "
