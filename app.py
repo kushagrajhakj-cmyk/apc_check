@@ -9,6 +9,9 @@ import json
 from scipy.optimize import differential_evolution
 import plotly.express as px
 from sklearn.ensemble import IsolationForest
+import os
+import uuid
+from datetime import datetime
 
 # =====================================================
 # PAGE CONFIG
@@ -92,6 +95,297 @@ def load_data():
     return data
 
 df = load_data()
+
+# =====================================================
+# OPERATOR FEEDBACK LOG
+# =====================================================
+# Every setpoint recommendation produced by either optimizer mode is
+# logged here the moment it's generated (status "pending"), and the
+# operator's accept / modify / reject decision is attached to that same
+# row once given. Over time this log is the raw material for refining
+# the model against real plant experience rather than historical data
+# alone:
+#   - "modified" rows, in aggregate, reveal a systematic bias to correct
+#     (e.g. operators always trimming Rxn Temp a few degrees below what
+#     the model suggests for a given grade transition)
+#   - "rejected" rows flag combinations the model badly misjudged
+#   - once the actual resulting product quality is recorded against a
+#     row (via record_actual_outcome), that row becomes a genuine
+#     (input, setpoint-used, outcome) example that can be fed back into
+#     retraining with extra weight, since it's plant-validated rather
+#     than just historical
+#
+# Storage is a flat CSV next to the app. That's enough for a
+# single-instance deployment; if this ever needs multiple concurrent
+# writers, swap load/save below for a real database without touching
+# any of the call sites.
+
+FEEDBACK_LOG_PATH = "feedback_log.csv"
+
+FEEDBACK_COLUMNS = [
+
+    "id",
+    "timestamp",
+    "mode",
+    "inputs",
+    "model_setpoints",
+    "model_predicted_quality",
+    "model_predicted_std",
+    "operator_decision",
+    "operator_setpoints",
+    "operator_reason",
+    "feedback_timestamp",
+    "actual_quality",
+    "actual_outcome_timestamp"
+
+]
+
+
+def init_feedback_log():
+
+    if not os.path.exists(FEEDBACK_LOG_PATH):
+
+        pd.DataFrame(columns=FEEDBACK_COLUMNS).to_csv(
+            FEEDBACK_LOG_PATH,
+            index=False
+        )
+
+
+def load_feedback_log():
+
+    init_feedback_log()
+
+    log = pd.read_csv(FEEDBACK_LOG_PATH)
+
+    # A freshly-created / edited-by-hand CSV might be missing a column
+    # added in a later version of this app — backfill so downstream code
+    # can always assume every column exists.
+    for col in FEEDBACK_COLUMNS:
+
+        if col not in log.columns:
+
+            log[col] = ""
+
+    return log
+
+
+def save_recommendation(
+
+    mode,
+    inputs,
+    model_setpoints,
+    model_predicted_quality,
+    model_predicted_std=None
+
+):
+    """Persist a new recommendation as a 'pending' row and return its id.
+
+    Called once, right when a recommendation is computed — before the
+    operator has had a chance to react to it — so every recommendation
+    is on record even if the operator never gives feedback.
+    """
+
+    log = load_feedback_log()
+
+    rec_id = uuid.uuid4().hex[:12]
+
+    row = {
+
+        "id": rec_id,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "mode": mode,
+        "inputs": json.dumps(inputs),
+        "model_setpoints": json.dumps(model_setpoints),
+        "model_predicted_quality": json.dumps(model_predicted_quality),
+        "model_predicted_std": (
+            json.dumps(model_predicted_std)
+            if model_predicted_std is not None else ""
+        ),
+        "operator_decision": "pending",
+        "operator_setpoints": "",
+        "operator_reason": "",
+        "feedback_timestamp": "",
+        "actual_quality": "",
+        "actual_outcome_timestamp": ""
+
+    }
+
+    log = pd.concat(
+        [log, pd.DataFrame([row])],
+        ignore_index=True
+    )
+
+    log.to_csv(FEEDBACK_LOG_PATH, index=False)
+
+    return rec_id
+
+
+def update_feedback(rec_id, decision, operator_setpoints, reason):
+    """Attach the operator's accept / modify / reject decision, plus
+    their own setpoints and reasoning if they changed anything, to an
+    existing recommendation row."""
+
+    log = load_feedback_log()
+
+    mask = log["id"] == rec_id
+
+    if not mask.any():
+
+        return False
+
+    log.loc[mask, "operator_decision"] = decision
+
+    log.loc[mask, "operator_setpoints"] = (
+        json.dumps(operator_setpoints) if operator_setpoints is not None else ""
+    )
+
+    log.loc[mask, "operator_reason"] = reason
+
+    log.loc[mask, "feedback_timestamp"] = datetime.now().isoformat(timespec="seconds")
+
+    log.to_csv(FEEDBACK_LOG_PATH, index=False)
+
+    return True
+
+
+def record_actual_outcome(rec_id, actual_quality):
+    """Attach the real, plant-measured product quality once it's known,
+    closing the loop between what was recommended/accepted and what
+    actually happened. This is what turns a row into a genuine training
+    example rather than just an opinion."""
+
+    log = load_feedback_log()
+
+    mask = log["id"] == rec_id
+
+    if not mask.any():
+
+        return False
+
+    log.loc[mask, "actual_quality"] = json.dumps(actual_quality)
+
+    log.loc[mask, "actual_outcome_timestamp"] = datetime.now().isoformat(timespec="seconds")
+
+    log.to_csv(FEEDBACK_LOG_PATH, index=False)
+
+    return True
+
+
+def render_feedback_widget(rec_id, widget_key_prefix, model_setpoints):
+    """Reusable accept / modify / reject control shown under any
+    recommendation. `model_setpoints` is a dict of {display label:
+    value} for exactly the setpoints the operator might want to
+    override — the same dict that was passed to save_recommendation
+    for this rec_id.
+    """
+
+    st.markdown("### Operator Feedback")
+
+    st.caption(
+        "Accept these setpoints, or override them based on plant "
+        "experience. Every decision is logged and used to refine the "
+        "model over time — the reason you give matters as much as the "
+        "number."
+    )
+
+    decision_label = st.radio(
+
+        "Your decision",
+
+        ["Accept as-is", "Accept with modification", "Reject"],
+
+        key=f"{widget_key_prefix}_decision_{rec_id}",
+
+        horizontal=True
+
+    )
+
+    operator_setpoints = None
+
+    if decision_label == "Accept with modification":
+
+        st.caption("Enter the setpoints you'll actually use on the plant:")
+
+        items = list(model_setpoints.items())
+
+        half = (len(items) + 1) // 2
+
+        oc1, oc2 = st.columns(2)
+
+        operator_setpoints = {}
+
+        for i, (label, value) in enumerate(items):
+
+            col = oc1 if i < half else oc2
+
+            with col:
+
+                operator_setpoints[label] = st.number_input(
+
+                    label,
+
+                    value=float(value),
+
+                    key=f"{widget_key_prefix}_opval_{rec_id}_{i}",
+
+                    format="%.4f"
+
+                )
+
+    reason = ""
+
+    if decision_label in ("Accept with modification", "Reject"):
+
+        reason = st.text_area(
+
+            "Reason, based on plant experience (required)",
+
+            key=f"{widget_key_prefix}_reason_{rec_id}",
+
+            help="E.g. 'this fouls the exchanger above 105C on this "
+                 "grade' or 'catalyst rate too aggressive for current "
+                 "batch of catalyst'. This is what eventually teaches "
+                 "the model what it's getting wrong."
+
+        )
+
+    submitted_key = f"{widget_key_prefix}_submitted_{rec_id}"
+
+    if st.button("Submit Feedback", key=f"{widget_key_prefix}_submit_{rec_id}"):
+
+        if decision_label != "Accept as-is" and not reason.strip():
+
+            st.error(
+                "Please add a reason before submitting — it's what "
+                "makes this feedback useful later on."
+            )
+
+        else:
+
+            decision_map = {
+                "Accept as-is": "accepted",
+                "Accept with modification": "modified",
+                "Reject": "rejected"
+            }
+
+            update_feedback(
+
+                rec_id,
+
+                decision_map[decision_label],
+
+                operator_setpoints,
+
+                reason.strip()
+
+            )
+
+            st.session_state[submitted_key] = True
+
+    if st.session_state.get(submitted_key):
+
+        st.success(f"Feedback recorded for recommendation `{rec_id}`.")
+
 
 # =====================================================
 # TIME-SERIES ANOMALY DETECTION (rolling-window Isolation Forest)
@@ -670,7 +964,7 @@ st.sidebar.markdown("---")
 # =====================================================
 # TABS
 # =====================================================
-tab1,tab2,tab3,tab4,tab5 = st.tabs(
+tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs(
 
     [
 
@@ -682,7 +976,9 @@ tab1,tab2,tab3,tab4,tab5 = st.tabs(
 
         "Model diagnostics",
 
-        "Anomaly Detection"
+        "Anomaly Detection",
+
+        "Feedback & Refinement"
 
 
     ]
@@ -1619,6 +1915,90 @@ with tab3:
                 optimal_input
             )
 
+            # Log this recommendation immediately, before the operator
+            # has reacted to it, so it's on record either way — then
+            # stash everything needed to redraw this result in
+            # session_state. Without this, clicking the feedback widget
+            # below (which reruns the whole script) would make the
+            # result vanish, since it's only computed inside
+            # `if run_button:`.
+
+            model_setpoints = {
+
+                "Rxn Temperature (°C)": float(best_temp),
+                "C2 Pressure (kg/cm²)": float(best_c2_pressure),
+                "H2/C2 ratio": float(best_h2_c2),
+                "C4/C2 ratio": float(best_c4_c2),
+                "C6/C2 ratio": float(best_c6_c2),
+                "ICA (mol %)": float(best_ica),
+                "Al/Ti ratio": float(best_al_ti),
+                "Catalyst Rate (kg/h)": float(best_cat_rate)
+
+            }
+
+            predicted_quality = {
+
+                "MFI @2.16 kg/cm2": float(pred[0]),
+                "Productivity kg PE/g cat": float(pred[1]),
+                "Density g/cc": float(pred[2])
+
+            }
+
+            predicted_std = {
+
+                "MFI @2.16 kg/cm2": float(std[0]),
+                "Productivity kg PE/g cat": float(std[1]),
+                "Density g/cc": float(std[2])
+
+            }
+
+            rec_id = save_recommendation(
+
+                mode="ML Optimizer",
+
+                inputs={
+
+                    "feed_rate": feed_rate,
+                    "target_mfi": target_mfi,
+                    "target_productivity": target_productivity,
+                    "target_density": target_density
+
+                },
+
+                model_setpoints=model_setpoints,
+
+                model_predicted_quality=predicted_quality,
+
+                model_predicted_std=predicted_std
+
+            )
+
+            st.session_state["ml_opt_result"] = {
+
+                "rec_id": rec_id,
+                "model_setpoints": model_setpoints,
+                "predicted_quality": predicted_quality,
+                "confidence": float(
+                    np.exp(-np.mean(std/np.abs(pred).clip(1e-6))) * 100
+                )
+
+            }
+
+            # A fresh recommendation means any earlier "submitted"
+            # banner no longer applies to *this* result.
+            st.session_state.pop(
+                f"ml_opt_submitted_{rec_id}", None
+            )
+
+        if "ml_opt_result" in st.session_state:
+
+            res = st.session_state["ml_opt_result"]
+
+            model_setpoints = res["model_setpoints"]
+            predicted_quality = res["predicted_quality"]
+            confidence = res["confidence"]
+            rec_id = res["rec_id"]
+
             st.markdown("---")
 
             col1,col2 = st.columns(2)
@@ -1633,7 +2013,7 @@ with tab3:
 
                     "Rxn Temperature (°C)",
 
-                    f"{best_temp:.2f}"
+                    f"{model_setpoints['Rxn Temperature (°C)']:.2f}"
 
                 )
 
@@ -1641,7 +2021,7 @@ with tab3:
 
                     "C2 Pressure (kg/cm²)",
 
-                    f"{best_c2_pressure:.2f}"
+                    f"{model_setpoints['C2 Pressure (kg/cm²)']:.2f}"
 
                 )
 
@@ -1649,7 +2029,7 @@ with tab3:
 
                     "H2/C2 ratio",
 
-                    f"{best_h2_c2:.3f}"
+                    f"{model_setpoints['H2/C2 ratio']:.3f}"
 
                 )
 
@@ -1657,7 +2037,7 @@ with tab3:
 
                     "C4/C2 ratio",
 
-                    f"{best_c4_c2:.3f}"
+                    f"{model_setpoints['C4/C2 ratio']:.3f}"
 
                 )
 
@@ -1665,7 +2045,7 @@ with tab3:
 
                     "C6/C2 ratio",
 
-                    f"{best_c6_c2:.3f}"
+                    f"{model_setpoints['C6/C2 ratio']:.3f}"
 
                 )
 
@@ -1673,7 +2053,7 @@ with tab3:
 
                     "ICA (mol %)",
 
-                    f"{best_ica:.2f}"
+                    f"{model_setpoints['ICA (mol %)']:.2f}"
 
                 )
 
@@ -1681,7 +2061,7 @@ with tab3:
 
                     "Al/Ti ratio",
 
-                    f"{best_al_ti:.1f}"
+                    f"{model_setpoints['Al/Ti ratio']:.1f}"
 
                 )
 
@@ -1689,7 +2069,7 @@ with tab3:
 
                     "Catalyst Rate (kg/h)",
 
-                    f"{best_cat_rate:.2f}"
+                    f"{model_setpoints['Catalyst Rate (kg/h)']:.2f}"
 
                 )
 
@@ -1703,7 +2083,7 @@ with tab3:
 
                     "Predicted MFI @2.16 kg/cm²",
 
-                    f"{pred[0]:.2f}"
+                    f"{predicted_quality['MFI @2.16 kg/cm2']:.2f}"
 
                 )
 
@@ -1711,7 +2091,7 @@ with tab3:
 
                     "Predicted Productivity (kg PE/g cat)",
 
-                    f"{pred[1]:.2f}"
+                    f"{predicted_quality['Productivity kg PE/g cat']:.2f}"
 
                 )
 
@@ -1719,7 +2099,7 @@ with tab3:
 
                     "Predicted Density (g/cc)",
 
-                    f"{pred[2]:.4f}"
+                    f"{predicted_quality['Density g/cc']:.4f}"
 
                 )
 
@@ -1727,45 +2107,9 @@ with tab3:
 
             comparison = pd.DataFrame({
 
-                "Variable":[
+                "Variable": list(model_setpoints.keys()),
 
-                    "Rxn Temperature (°C)",
-
-                    "C2 Pressure (kg/cm²)",
-
-                    "H2/C2",
-
-                    "C4/C2",
-
-                    "C6/C2",
-
-                    "ICA (mol %)",
-
-                    "Al/Ti",
-
-                    "Catalyst Rate (kg/h)"
-
-                ],
-
-                "Recommended":[
-
-                    best_temp,
-
-                    best_c2_pressure,
-
-                    best_h2_c2,
-
-                    best_c4_c2,
-
-                    best_c6_c2,
-
-                    best_ica,
-
-                    best_al_ti,
-
-                    best_cat_rate
-
-                ]
+                "Recommended": list(model_setpoints.values())
 
             })
 
@@ -1781,10 +2125,6 @@ with tab3:
 
             )
 
-            confidence = np.exp(
-                -np.mean(std/np.abs(pred).clip(1e-6))
-            ) * 100
-
             st.subheader(
                 "Model Confidence"
             )
@@ -1795,6 +2135,14 @@ with tab3:
 
             st.write(
                 f"{confidence:.1f}%"
+            )
+
+            st.markdown("---")
+
+            render_feedback_widget(
+                rec_id,
+                "ml_opt",
+                model_setpoints
             )
 
     # ==========================================
@@ -2002,16 +2350,90 @@ with tab3:
 
                 )
 
+            # Log the recommendation and stash everything needed to
+            # redraw it, same reasoning as Mode 1: the feedback widget
+            # below reruns the whole script, and without session_state
+            # this whole result would disappear the instant the operator
+            # touches it.
+
+            model_setpoints = {
+
+                "Refined Rxn Temp Setpoint (°C)": float(setpoints["temp_setpoint_refined"]),
+                "Reactant Pressure Setpoint (psig)": float(setpoints["pressure_setpoint"]),
+                "Melt Index Setpoint": float(setpoints["mi_setpoint"]),
+                "H2/C2": float(setpoints["h2_c2"]),
+                "C4/C2": float(setpoints["c4_c2"]),
+                "C6/C2": float(setpoints["c6_c2"]),
+                "ICA (mol %)": float(setpoints["ica"]),
+                "Al/Ti": float(setpoints["al_ti"]),
+                "Catalyst Rate (kg/h)": float(setpoints["cat_rate"])
+
+            }
+
+            predicted_quality = {
+
+                "MFI @2.16 kg/cm2": float(setpoints["predicted_mfi"]),
+                "Productivity kg PE/g cat": float(setpoints["predicted_productivity"]),
+                "Density g/cc": float(setpoints["predicted_density"])
+
+            }
+
+            rec_id = save_recommendation(
+
+                mode="Patent + Knowledge Base",
+
+                inputs={
+
+                    "p1_temp": p1_temp,
+                    "p1_mi": p1_mi,
+                    "p1_pressure": p1_pressure,
+                    "p1_density": p1_density,
+                    "p2_temp": p2_temp,
+                    "p2_mi": p2_mi,
+                    "p2_density": p2_density,
+                    "search_feed_rate": search_feed_rate,
+                    "soft_target_productivity": soft_target_productivity,
+                    "acceptable_tol": acceptable_tol
+
+                },
+
+                model_setpoints=model_setpoints,
+
+                model_predicted_quality=predicted_quality
+
+            )
+
+            st.session_state["patent_result"] = {
+
+                "rec_id": rec_id,
+                "setpoints": setpoints,
+                "model_setpoints": model_setpoints,
+                "p2_mi": p2_mi,
+                "p2_density": p2_density,
+                "acceptable_tol": acceptable_tol
+
+            }
+
+            st.session_state.pop(
+                f"patent_submitted_{rec_id}", None
+            )
+
+        if "patent_result" in st.session_state:
+
+            pres = st.session_state["patent_result"]
+
+            rec_id = pres["rec_id"]
+            setpoints = pres["setpoints"]
+            model_setpoints = pres["model_setpoints"]
+            p2_mi = pres["p2_mi"]
+            p2_density = pres["p2_density"]
+            acceptable_tol = pres["acceptable_tol"]
+
             st.markdown("---")
 
             direction_note = (
-                "Reading AIChE, Journal. Oct. 1992, vol. 38, No. 10, pp. 1564-1576.\n\n"
-                "Reading  AICHhE Journal, Mar. 1994, vol. 40, No. 3, pp. 506-520.\n\n"
-                "Product 2 MI is higher than Product 1 MI, reading patent US5627242A...\n\n" if setpoints["mi_increasing"]
-                
-                else "Reading AIChE, Journal. Oct. 1992, vol. 38, No. 10, pp. 1564-1576.\n\n"
-                     "Reading  AICHhE Journal, Mar. 1994, vol. 40, No. 3, pp. 506-520.\n\n"
-                     "Product 2 MI is lower than Product 1 MI (or equal), reading patent US5627242A...\n\n "
+                "Product 2 MI is higher than Product 1 MI, reading patent US5627242A..." if setpoints["mi_increasing"]
+                else "Product 2 MI is lower than Product 1 MI (or equal), reading patent US5627242A... "
             )
 
             st.info(f"Direction rule in effect: **{direction_note}**")
@@ -2249,6 +2671,14 @@ with tab3:
                     f"with the data-driven optimizer mode."
 
                 )
+
+            st.markdown("---")
+
+            render_feedback_widget(
+                rec_id,
+                "patent",
+                model_setpoints
+            )
 
 
 
@@ -2717,6 +3147,385 @@ with tab5:
             f"separates a process drift from a sensor glitch."
 
         )
+
+# =====================================================
+# OPERATOR FEEDBACK & MODEL REFINEMENT
+# =====================================================
+
+with tab6:
+
+    st.subheader(
+        "Operator Feedback & Model Refinement"
+    )
+
+    st.caption(
+        "Every setpoint recommendation from the Optimizer tab is logged "
+        "here the moment it's generated. Accept / modify / reject "
+        "decisions — and the reasons behind them — are what let this "
+        "model be refined against real plant experience over time, "
+        "rather than historical data alone."
+    )
+
+    feedback_log = load_feedback_log()
+
+    if feedback_log.empty:
+
+        st.info(
+            "No recommendations logged yet. Generate one from the "
+            "Optimizer tab and give it feedback to see it here."
+        )
+
+    else:
+
+        total = len(feedback_log)
+
+        decision_counts = feedback_log["operator_decision"].value_counts()
+
+        n_pending = int(decision_counts.get("pending", 0))
+        n_accepted = int(decision_counts.get("accepted", 0))
+        n_modified = int(decision_counts.get("modified", 0))
+        n_rejected = int(decision_counts.get("rejected", 0))
+        n_reviewed = total - n_pending
+
+        st.markdown("### Summary")
+
+        m1,m2,m3,m4,m5 = st.columns(5)
+
+        with m1:
+
+            st.metric("Total recommendations", f"{total}")
+
+        with m2:
+
+            st.metric("Awaiting review", f"{n_pending}")
+
+        with m3:
+
+            accept_rate = 100 * n_accepted / n_reviewed if n_reviewed else 0
+
+            st.metric(
+                "Accepted as-is",
+                f"{n_accepted}",
+                delta=f"{accept_rate:.0f}% of reviewed"
+            )
+
+        with m4:
+
+            modify_rate = 100 * n_modified / n_reviewed if n_reviewed else 0
+
+            st.metric(
+                "Modified",
+                f"{n_modified}",
+                delta=f"{modify_rate:.0f}% of reviewed"
+            )
+
+        with m5:
+
+            reject_rate = 100 * n_rejected / n_reviewed if n_reviewed else 0
+
+            st.metric(
+                "Rejected",
+                f"{n_rejected}",
+                delta=f"{reject_rate:.0f}% of reviewed"
+            )
+
+        st.markdown("---")
+
+        st.markdown("### Decisions Over Time")
+
+        decision_df = feedback_log.copy()
+
+        decision_df["timestamp"] = pd.to_datetime(
+            decision_df["timestamp"], errors="coerce"
+        )
+
+        decision_df = decision_df.dropna(subset=["timestamp"])
+
+        if decision_df.empty:
+
+            st.info("Not enough timestamped data yet to plot a trend.")
+
+        else:
+
+            fig_decisions = px.histogram(
+
+                decision_df,
+
+                x="timestamp",
+
+                color="operator_decision",
+
+                title="Recommendations by Decision, Over Time"
+
+            )
+
+            st.plotly_chart(
+                fig_decisions,
+                use_container_width=True
+            )
+
+        st.markdown("---")
+
+        st.markdown("### Where Operators Override the Model")
+
+        st.caption(
+            "For every 'modified' recommendation, this shows how far "
+            "the operator's setpoint sat from the model's, averaged "
+            "per variable. A consistent, sizeable average delta on a "
+            "variable is a systematic bias worth correcting before the "
+            "next retraining pass — before touching the model at all, "
+            "this alone tells you where it's directionally off."
+        )
+
+        modified_rows = feedback_log[
+            feedback_log["operator_decision"] == "modified"
+        ]
+
+        if modified_rows.empty:
+
+            st.info("No modified recommendations yet.")
+
+        else:
+
+            deltas = {}
+
+            for _, row in modified_rows.iterrows():
+
+                try:
+
+                    model_vals = json.loads(row["model_setpoints"])
+                    operator_vals = json.loads(row["operator_setpoints"])
+
+                except (TypeError, ValueError):
+
+                    continue
+
+                for label, op_val in operator_vals.items():
+
+                    model_val = model_vals.get(label)
+
+                    if model_val is None:
+                        continue
+
+                    deltas.setdefault(label, []).append(op_val - model_val)
+
+            if not deltas:
+
+                st.info(
+                    "No comparable setpoint values found in the "
+                    "modified rows yet."
+                )
+
+            else:
+
+                delta_summary = pd.DataFrame({
+
+                    "Variable": list(deltas.keys()),
+                    "Avg Operator - Model Delta": [
+                        float(np.mean(v)) for v in deltas.values()
+                    ],
+                    "N": [len(v) for v in deltas.values()]
+
+                })
+
+                fig_delta = px.bar(
+
+                    delta_summary,
+
+                    x="Variable",
+
+                    y="Avg Operator - Model Delta",
+
+                    title="Average Operator Override vs Model Recommendation"
+
+                )
+
+                st.plotly_chart(
+                    fig_delta,
+                    use_container_width=True
+                )
+
+                st.dataframe(
+                    delta_summary,
+                    use_container_width=True
+                )
+
+        st.markdown("---")
+
+        st.markdown("### Full Feedback Log")
+
+        display_cols = [
+
+            "id",
+            "timestamp",
+            "mode",
+            "operator_decision",
+            "operator_reason",
+            "feedback_timestamp"
+
+        ]
+
+        st.dataframe(
+
+            feedback_log[display_cols].sort_values(
+                "timestamp", ascending=False
+            ),
+
+            use_container_width=True
+
+        )
+
+        with st.expander("Inspect a single recommendation in full"):
+
+            chosen_id = st.selectbox(
+
+                "Recommendation ID",
+
+                feedback_log["id"].tolist(),
+
+                key="feedback_inspect_id"
+
+            )
+
+            chosen_row = feedback_log[
+                feedback_log["id"] == chosen_id
+            ].iloc[0]
+
+            insp1,insp2 = st.columns(2)
+
+            with insp1:
+
+                st.markdown("**Model recommended**")
+
+                st.json(
+                    json.loads(chosen_row["model_setpoints"])
+                    if chosen_row["model_setpoints"] else {}
+                )
+
+                st.markdown("**Model predicted quality**")
+
+                st.json(
+                    json.loads(chosen_row["model_predicted_quality"])
+                    if chosen_row["model_predicted_quality"] else {}
+                )
+
+            with insp2:
+
+                st.markdown("**Operator decision**")
+
+                st.write(chosen_row["operator_decision"])
+
+                st.markdown("**Operator setpoints (if modified)**")
+
+                st.json(
+                    json.loads(chosen_row["operator_setpoints"])
+                    if chosen_row["operator_setpoints"] else {}
+                )
+
+                st.markdown("**Operator reason**")
+
+                st.write(chosen_row["operator_reason"] or "—")
+
+                if chosen_row["actual_quality"]:
+
+                    st.markdown("**Actual plant outcome**")
+
+                    st.json(json.loads(chosen_row["actual_quality"]))
+
+        st.markdown("---")
+
+        st.markdown("### Record Actual Plant Outcome")
+
+        st.caption(
+            "Once a recommendation has actually run on the plant and "
+            "the real product quality is known, record it here. This "
+            "is what turns a row from an opinion into a genuine "
+            "(input, setpoint used, outcome) example for the next "
+            "retraining pass."
+        )
+
+        outcome_candidates = feedback_log[
+            feedback_log["operator_decision"] != "pending"
+        ]["id"].tolist()
+
+        if not outcome_candidates:
+
+            st.info(
+                "No reviewed recommendations available yet to attach "
+                "an outcome to."
+            )
+
+        else:
+
+            outcome_id = st.selectbox(
+
+                "Recommendation ID",
+
+                outcome_candidates,
+
+                key="outcome_rec_id"
+
+            )
+
+            oc1,oc2,oc3 = st.columns(3)
+
+            with oc1:
+
+                actual_mfi = st.number_input(
+
+                    "Actual MFI @2.16 kg/cm²",
+
+                    value=0.0,
+
+                    key="actual_mfi",
+
+                    format="%.3f"
+
+                )
+
+            with oc2:
+
+                actual_prod = st.number_input(
+
+                    "Actual Productivity (kg PE/g cat)",
+
+                    value=0.0,
+
+                    key="actual_prod",
+
+                    format="%.3f"
+
+                )
+
+            with oc3:
+
+                actual_density = st.number_input(
+
+                    "Actual Density (g/cc)",
+
+                    value=0.0,
+
+                    key="actual_density",
+
+                    format="%.4f"
+
+                )
+
+            if st.button("Save Actual Outcome", key="save_outcome_button"):
+
+                record_actual_outcome(
+
+                    outcome_id,
+
+                    {
+                        "MFI @2.16 kg/cm2": actual_mfi,
+                        "Productivity kg PE/g cat": actual_prod,
+                        "Density g/cc": actual_density
+                    }
+
+                )
+
+                st.success(f"Actual outcome recorded for `{outcome_id}`.")
 
 st.markdown("---")
 
