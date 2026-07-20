@@ -115,12 +115,13 @@ df = load_data()
 #     retraining with extra weight, since it's plant-validated rather
 #     than just historical
 #
-# Storage is a flat CSV next to the app. That's enough for a
-# single-instance deployment; if this ever needs multiple concurrent
-# writers, swap load/save below for a real database without touching
-# any of the call sites.
+# Storage is a single Excel workbook next to the app, shared by both
+# optimizer modes (the "mode" column tells them apart). That's enough
+# for a single-instance deployment; if this ever needs multiple
+# concurrent writers, swap load/save below for a real database without
+# touching any of the call sites.
 
-FEEDBACK_LOG_PATH = "feedback_log.csv"
+FEEDBACK_LOG_PATH = "feedback_log.xlsx"
 
 FEEDBACK_COLUMNS = [
 
@@ -145,7 +146,7 @@ def init_feedback_log():
 
     if not os.path.exists(FEEDBACK_LOG_PATH):
 
-        pd.DataFrame(columns=FEEDBACK_COLUMNS).to_csv(
+        pd.DataFrame(columns=FEEDBACK_COLUMNS).to_excel(
             FEEDBACK_LOG_PATH,
             index=False
         )
@@ -155,11 +156,21 @@ def load_feedback_log():
 
     init_feedback_log()
 
-    log = pd.read_csv(FEEDBACK_LOG_PATH)
+    # dtype=str forces every column to stay object/string dtype on
+    # read. Without this, a column that's blank for every existing row
+    # (e.g. "operator_setpoints" before any feedback has been given)
+    # gets inferred as float64 (blank -> NaN), and a later string
+    # assignment into that column raises
+    # "TypeError: Invalid value ... for dtype 'float64'" on newer
+    # pandas. Blank cells still come back as NaN even with dtype=str,
+    # so fillna("") turns them back into plain empty strings.
+    log = pd.read_excel(FEEDBACK_LOG_PATH, dtype=str)
 
-    # A freshly-created / edited-by-hand CSV might be missing a column
-    # added in a later version of this app — backfill so downstream code
-    # can always assume every column exists.
+    log = log.fillna("")
+
+    # A file created / edited by hand, or by an older version of this
+    # app, might be missing a column added later — backfill so
+    # downstream code can always assume every column exists.
     for col in FEEDBACK_COLUMNS:
 
         if col not in log.columns:
@@ -182,7 +193,10 @@ def save_recommendation(
 
     Called once, right when a recommendation is computed — before the
     operator has had a chance to react to it — so every recommendation
-    is on record even if the operator never gives feedback.
+    is on record even if the operator never gives feedback. Used by
+    both optimizer modes (Mode 1 passes mode="ML Optimizer", Mode 2
+    passes mode="Patent + Knowledge Base"), so both write into the same
+    feedback_log.xlsx workbook.
     """
 
     log = load_feedback_log()
@@ -215,7 +229,7 @@ def save_recommendation(
         ignore_index=True
     )
 
-    log.to_csv(FEEDBACK_LOG_PATH, index=False)
+    log.to_excel(FEEDBACK_LOG_PATH, index=False)
 
     return rec_id
 
@@ -243,7 +257,7 @@ def update_feedback(rec_id, decision, operator_setpoints, reason):
 
     log.loc[mask, "feedback_timestamp"] = datetime.now().isoformat(timespec="seconds")
 
-    log.to_csv(FEEDBACK_LOG_PATH, index=False)
+    log.to_excel(FEEDBACK_LOG_PATH, index=False)
 
     return True
 
@@ -266,7 +280,7 @@ def record_actual_outcome(rec_id, actual_quality):
 
     log.loc[mask, "actual_outcome_timestamp"] = datetime.now().isoformat(timespec="seconds")
 
-    log.to_csv(FEEDBACK_LOG_PATH, index=False)
+    log.to_excel(FEEDBACK_LOG_PATH, index=False)
 
     return True
 
