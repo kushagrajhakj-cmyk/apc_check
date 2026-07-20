@@ -2005,8 +2005,8 @@ with tab3:
             st.markdown("---")
 
             direction_note = (
-                "Product 2 MI is higher than Product 1 MI" if setpoints["mi_increasing"]
-                else "Product 2 MI is lower than Product 1 MI (or equal)"
+                "Product 2 MI is higher than Product 1 MI, reading patent US5627242A..." if setpoints["mi_increasing"]
+                else "Product 2 MI is lower than Product 1 MI (or equal), reading patent US5627242A... "
             )
 
             st.info(f"Direction rule in effect: **{direction_note}**")
