@@ -230,6 +230,41 @@ def ensemble_predict(input_vector):
 
     return mean_pred,std_pred,preds
 
+
+def ensemble_predict_batch(X):
+
+    # Same ensemble math as ensemble_predict() above (average of the XGB
+    # and ANN predictions), just evaluated for many rows at once instead
+    # of one row per Python call. This exists purely to make the
+    # differential_evolution search in patent_grade_transition_setpoints
+    # fast enough to finish (it evaluates thousands of candidate points,
+    # and calling ensemble_predict() once per candidate meant re-building
+    # a DataFrame and re-running both models thousands of times). It does
+    # not change what gets predicted for a given input — for a single
+    # row it returns exactly what ensemble_predict() returns as mean_pred.
+
+    X_df = pd.DataFrame(
+        X,
+        columns=feature_names
+    )
+
+    xgb_pred = xgb_model.predict(X_df)
+
+    scaled = scaler.transform(X_df)
+
+    tensor = torch.tensor(
+        scaled,
+        dtype=torch.float32
+    )
+
+    with torch.no_grad():
+
+        ann_pred = ann_model(tensor).numpy()
+
+    mean_pred = (np.asarray(xgb_pred) + np.asarray(ann_pred)) / 2.0
+
+    return mean_pred
+
 # =====================================================
 # OPTIMIZER
 # =====================================================
@@ -440,9 +475,73 @@ def patent_grade_transition_setpoints(
 
         )
 
+    def objective_vectorized(x_pop):
+
+        # Identical formula to objective() above, just evaluated for the
+        # whole differential_evolution population in one shot (via
+        # ensemble_predict_batch) instead of one candidate per Python
+        # call. This is what makes the search finish in seconds instead
+        # of hanging — nothing about the bounds, weights, or direction
+        # rules changes; scipy requires updating='deferred' whenever a
+        # vectorized objective is used, hence that setting below.
+
+        x_pop = np.asarray(x_pop)
+
+        temp_delta = x_pop[0]
+        pressure_delta = x_pop[1]
+        h2_c2 = x_pop[2]
+        c4_c2 = x_pop[3]
+        c6_c2 = x_pop[4]
+        ica = x_pop[5]
+        al_ti = x_pop[6]
+        cat_rate = x_pop[7]
+
+        n_candidates = x_pop.shape[1]
+
+        if mi_increasing:
+            temp_refined = p2_temp + temp_delta
+            pressure_sp = p1_pressure - pressure_delta
+        else:
+            temp_refined = p2_temp - temp_delta
+            pressure_sp = p1_pressure + pressure_delta
+
+        X = np.column_stack([
+
+            temp_refined,
+            pressure_sp * PSIG_TO_KGCM2,
+            h2_c2,
+            c4_c2,
+            c6_c2,
+            ica,
+            al_ti,
+            np.full(n_candidates, feed_rate),
+            cat_rate
+
+        ])
+
+        mean_pred = ensemble_predict_batch(X)
+
+        mfi_pred = mean_pred[:, 0]
+        prod_pred = mean_pred[:, 1]
+        density_pred = mean_pred[:, 2]
+
+        return (
+
+            MFI_WEIGHT * ((mfi_pred - p2_mi) / max(p2_mi,1e-6)) ** 2
+
+            +
+
+            DENSITY_WEIGHT * ((density_pred - p2_density) / max(p2_density,1e-6)) ** 2
+
+            +
+
+            PRODUCTIVITY_WEIGHT * ((prod_pred - target_productivity) / max(target_productivity,1e-6)) ** 2
+
+        )
+
     result = differential_evolution(
 
-        objective,
+        objective_vectorized,
 
         bounds,
 
@@ -450,7 +549,11 @@ def patent_grade_transition_setpoints(
 
         popsize=15,
 
-        seed=42
+        seed=42,
+
+        vectorized=True,
+
+        updating="deferred"
 
     )
 
@@ -652,7 +755,7 @@ border-left:14px solid #1E88E5;
 <div style="
 position:absolute;
 left:45px;
-top:240px;
+top:235px;
 color:#0D47A1;
 font-size:14px;
 ">
@@ -662,13 +765,16 @@ P = {st.session_state.c2_pressure:.1f} kg/cm&sup2;
 </div>
 
 <!-- ================= COMONOMER (C4/C2, C6/C2 ratios) ================= -->
-<!-- horizontal line from x=140 to x=420 (reactor left edge) -->
+<!-- horizontal line from x=40 to x=420 (reactor left edge) -->
+<!-- Same start point (x=40) and width as the C2 FEED line above, so both -->
+<!-- feed lines are the same length. Its label keeps the same 15px gap -->
+<!-- below its line that every other stream label keeps from its line. -->
 
 <div style="
 position:absolute;
-left:140px;
+left:40px;
 top:380px;
-width:280px;
+width:380px;
 border-top:3px solid green;
 "></div>
 
@@ -684,7 +790,7 @@ border-left:14px solid green;
 
 <div style="
 position:absolute;
-left:145px;
+left:45px;
 top:395px;
 color:green;
 font-size:13px;
@@ -719,7 +825,7 @@ border-top:14px solid #1976D2;
 <div style="
 position:absolute;
 left:400px;
-top:10px;
+top:6px;
 color:#1565C0;
 text-align:center;
 font-size:14px;
@@ -753,7 +859,7 @@ border-top:14px solid #8E24AA;
 <div style="
 position:absolute;
 left:530px;
-top:10px;
+top:6px;
 color:#6A1B9A;
 text-align:center;
 font-size:14px;
@@ -818,7 +924,7 @@ border-bottom:14px solid red;
 <div style="
 position:absolute;
 left:395px;
-top:545px;
+top:555px;
 color:red;
 text-align:center;
 font-size:13px;
@@ -852,7 +958,7 @@ border-bottom:14px solid orange;
 <div style="
 position:absolute;
 left:525px;
-top:545px;
+top:555px;
 color:orange;
 text-align:center;
 font-size:13px;
